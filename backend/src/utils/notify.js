@@ -1,0 +1,84 @@
+const { createNotification } = require("../db");
+const { getIO } = require("../socket");
+
+async function notify({ userId, type, taskId, taskTitle, workspaceId, message }) {
+  const notif = await createNotification({ userId, type, taskId, taskTitle, workspaceId, message });
+  try {
+    getIO().to(`user:${userId}`).emit("notification:new", notif);
+  } catch (err) {
+    // Socket layer not ready (e.g. during tests) — notification is still persisted.
+  }
+  return notif;
+}
+
+function broadcastTaskChange(workspaceId, payload) {
+  try {
+    getIO().to(`workspace:${workspaceId}`).emit("task:changed", { workspaceId, ...payload });
+  } catch (err) {
+    // ignore if socket layer isn't up
+  }
+  // A file or link on a task is also a change to what the Files page shows,
+  // and it is raised here rather than at each of the eight call sites so a
+  // future one can't forget it.
+  if ((payload?.reason === "attachment" || payload?.reason === "link") && payload?.projectId) {
+    broadcastDocumentsChanged(workspaceId, payload.projectId);
+  }
+}
+
+function broadcastLeadChange(workspaceId, leadId) {
+  try {
+    getIO().to(`workspace:${workspaceId}`).emit("lead:changed", { workspaceId, leadId });
+  } catch (err) {
+    // ignore
+  }
+}
+
+function broadcastMemberAdded(workspaceId) {
+  try {
+    getIO().to(`workspace:${workspaceId}`).emit("members:changed", { workspaceId });
+  } catch (err) {
+    // ignore
+  }
+}
+
+function broadcastProjectsChanged(workspaceId) {
+  try {
+    getIO().to(`workspace:${workspaceId}`).emit("projects:changed", { workspaceId });
+  } catch (err) {
+    // ignore
+  }
+}
+
+// A comment on someone's activity-log entry. Scoped by log id so an open
+// entry can refresh just itself, the same way task comments do.
+function broadcastActivityComment(workspaceId, logId) {
+  try {
+    getIO().to(`workspace:${workspaceId}`).emit("activity:comment", { workspaceId, logId });
+  } catch (err) {
+    console.error("activity:comment broadcast failed:", err.message);
+  }
+}
+
+// An activity-log entry itself changed (e.g. an activity marked complete),
+// so anything showing it can refresh.
+function broadcastActivityChanged(workspaceId, logId) {
+  try {
+    getIO().to(`workspace:${workspaceId}`).emit("activity:changed", { workspaceId, logId });
+  } catch (err) {
+    console.error("activity:changed broadcast failed:", err.message);
+  }
+}
+
+// A file or link was added or removed anywhere inside a project — a project
+// document, or a file attached to one of its activities. The Files page
+// shows both, and it used to load once on mount, so a file uploaded from a
+// task simply never appeared there until a manual reload.
+function broadcastDocumentsChanged(workspaceId, projectId) {
+  try {
+    getIO().to(`workspace:${workspaceId}`).emit("documents:changed", { workspaceId, projectId });
+  } catch (err) {
+    console.error("documents:changed broadcast failed:", err.message);
+  }
+}
+
+module.exports = { notify, broadcastTaskChange, broadcastLeadChange, broadcastMemberAdded, broadcastProjectsChanged, broadcastActivityComment, broadcastActivityChanged, broadcastDocumentsChanged };

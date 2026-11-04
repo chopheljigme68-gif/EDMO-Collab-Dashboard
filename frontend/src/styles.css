@@ -1,0 +1,843 @@
+:root[data-theme="dark"] {
+  --ink: #12141c;
+  --panel: #191d28;
+  --raised: #232a3b;
+  --line: #2b3142;
+  --text: #eceef3;
+  --text-dim: #8b93a7;
+  --text-faint: #5c6478;
+  --accent: #2FA34F;
+  --accent-ink: #07170a;
+  --accent-soft: #2FA34F22;
+  /* Meaning-carrying greens, split from --accent. --accent is the person's
+     own choice (Appearance → Accent colour) and tints interactive chrome;
+     these stay brand green whatever they pick, because they SAY something:
+     a clock time, a completed task. A red accent must not make finished work
+     look urgent. They equal the default accent, so nothing moves for anyone
+     who never changes it. */
+  --success: #2FA34F;
+  --success-ink: #07170a;
+  --success-soft: #2FA34F22;
+  --clock: #2FA34F;
+  --clock-soft: #2FA34F22;
+  --stage-backlog: #7c8494;
+  --stage-progress: #6e9bff;
+  --stage-review: #2FA34F;
+  --stage-done: #4fd1c5;
+  --pri-low: #4fd1c5;
+  --pri-medium: #e8a33d;
+  --pri-high: #e8615b;
+  /* Scheduled-date text (Upcoming/Pending/Past agenda rows). Dates were
+     using --text-faint and read as disabled next to the green times, so
+     they get their own token: a clear blue that stays distinct from the
+     brand green (--accent) used for clock times, and from the priority
+     colours. */
+  --date-scheduled: #8fb4ff;
+  /* Supervisor notes under an agenda row. Deliberately NOT --pri-high:
+     full-saturation red on a dark ground vibrates and made the whole
+     Pending block painful to read. This is the same hue, desaturated and
+     lightened, so a note still reads as a note without shouting. */
+  --comment-note: #e2a09a;
+  --comment-note-line: rgba(226, 160, 154, 0.55);
+  --chart-grid: #2b3142;
+  --chart-tick: #8b93a7;
+  --chart-tooltip-bg: #20263f;
+  --backdrop: rgba(8, 9, 13, 0.7);
+}
+
+:root[data-theme="light"] {
+  --ink: #f3f5f9;
+  --panel: #ffffff;
+  --raised: #eef1f7;
+  --line: #dee3ed;
+  --text: #171a22;
+  --text-dim: #5b6272;
+  --text-faint: #9098aa;
+  --accent: #1F7D3B;
+  --accent-ink: #ffffff;
+  --accent-soft: #1F7D3B1a;
+  --success: #1F7D3B;
+  --success-ink: #ffffff;
+  --success-soft: #1F7D3B1a;
+  --clock: #1F7D3B;
+  --clock-soft: #1F7D3B1a;
+  --stage-backlog: #767e91;
+  --stage-progress: #3d6fe0;
+  --stage-review: #1F7D3B;
+  --stage-done: #1f9a8c;
+  --pri-low: #1f9a8c;
+  --pri-medium: #c9821b;
+  --pri-high: #d1453d;
+  --date-scheduled: #2f5fc0;
+  --comment-note: #b8514a;
+  --comment-note-line: rgba(184, 81, 74, 0.5);
+  --chart-grid: #dee3ed;
+  --chart-tick: #5b6272;
+  --chart-tooltip-bg: #ffffff;
+  --backdrop: rgba(20, 22, 30, 0.35);
+}
+
+/* Warm — a light theme on paper rather than on white. Same structure and
+   the same brand green, but every neutral carries a warm (amber/brown) cast
+   instead of the cool blue-grey of the light theme, which is easier on the
+   eyes under long office use and warm office lighting.
+
+   The status colours are shifted warm too (deeper reds, ochre amber) so they
+   sit in the same family as the neutrals — dropping the cool-theme values in
+   unchanged makes them glare against a cream ground. They stay clearly
+   distinct from the brand green, per the palette rule in CLAUDE.md. */
+:root[data-theme="warm"] {
+  --ink: #f4ecdf;
+  --panel: #fdf8f0;
+  --raised: #efe4d3;
+  --line: #ddcdb6;
+  --text: #2c231a;
+  --text-dim: #6b5a48;
+  --text-faint: #9c8973;
+  --accent: #1d7038;
+  --accent-ink: #fffaf3;
+  --accent-soft: #1d70381f;
+  --success: #1d7038;
+  --success-ink: #fffaf3;
+  --success-soft: #1d70381f;
+  --clock: #1d7038;
+  --clock-soft: #1d70381f;
+  --stage-backlog: #8a7a66;
+  --stage-progress: #a9631f;
+  --stage-review: #1d7038;
+  --stage-done: #1c8375;
+  --pri-low: #1c8375;
+  --pri-medium: #b2741a;
+  --pri-high: #bf4430;
+  --date-scheduled: #9a5a12;
+  --comment-note: #a9584a;
+  --comment-note-line: rgba(169, 88, 74, 0.5);
+  --chart-grid: #ddcdb6;
+  --chart-tick: #6b5a48;
+  --chart-tooltip-bg: #fdf8f0;
+  --backdrop: rgba(56, 42, 28, 0.38);
+}
+
+/* Native controls (time pickers, range sliders, any checkbox or radio the
+   browser draws) follow the personal accent too — the same thing macOS does,
+   and the difference between a theme and a coat of paint. */
+:root { accent-color: var(--accent); }
+::selection { background: var(--accent-soft); }
+
+/* A completed-state checkbox is a STATUS, not a control choice: it stays
+   green like every other "done" in the app. */
+.tfh-checkbox.checked.success { background: var(--success); border-color: var(--success); }
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  min-height: 100vh;
+  margin: 0;
+}
+
+body {
+  background: var(--ink);
+  color: var(--text);
+  font-family: "Inter", sans-serif;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+.tfh-scrollbar-none::-webkit-scrollbar { display: none; }
+
+.tfh-display { font-family: "Fraunces", serif; }
+.tfh-mono { font-family: "IBM Plex Mono", monospace; }
+
+button { font-family: inherit; cursor: pointer; color: inherit; }
+input, textarea, select { font-family: inherit; }
+input:focus, textarea:focus, select:focus, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.tfh-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.tfh-nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; border-radius: 10px; border: none;
+  background: transparent; color: var(--text-dim);
+  font-size: 14px; font-weight: 500; width: 100%; text-align: left;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.tfh-nav-item:hover { background: var(--raised); color: var(--text); }
+.tfh-nav-item.active { background: var(--accent-soft); color: var(--accent); }
+/* An ACTION in the nav list, not a destination: brand-tinted and dashed so
+   it reads as "this does something" rather than "this is a page you're not
+   on". It never gets .active, because clicking it leaves you where you are. */
+.tfh-nav-action {
+  color: var(--accent);
+  border: 1px dashed color-mix(in srgb, var(--accent) 45%, transparent);
+  background: transparent;
+}
+.tfh-nav-action:hover { background: var(--accent-soft); color: var(--accent); }
+
+.tfh-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border-radius: 10px; border: 1px solid var(--line); background: var(--raised);
+  color: var(--text); font-size: 13px; font-weight: 500; padding: 8px 14px;
+  transition: transform 0.1s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.tfh-btn:hover { border-color: var(--text-faint); transform: translateY(-1px); }
+.tfh-btn:active { transform: translateY(0); }
+.tfh-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.tfh-btn-accent { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+.tfh-btn-accent:hover { filter: brightness(1.08); }
+.tfh-btn-ghost { background: transparent; border-color: transparent; }
+.tfh-btn-ghost:hover { background: var(--raised); border-color: var(--line); }
+.tfh-btn-danger { border-color: var(--pri-high); color: var(--pri-high); background: transparent; }
+
+.tfh-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 600;
+  border: 1px solid transparent;
+}
+
+/* Any clickable link (task/subtask/milestone/activity, staged or saved).
+   The pointer cursor + hover underline is what makes it read — and feel —
+   like a real link, which is what was missing. */
+.tfh-link { cursor: pointer; }
+.tfh-link:hover { text-decoration: underline !important; }
+
+.tfh-input {
+  background: var(--raised); border: 1px solid var(--line); border-radius: 10px;
+  color: var(--text); padding: 8px 12px; font-size: 13px; width: 100%;
+}
+.tfh-input::placeholder { color: var(--text-faint); }
+.tfh-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-faint); font-weight: 600; margin-bottom: 6px; display: block;
+}
+
+.tfh-avatar {
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 999px; font-size: 12px; font-weight: 700; color: #12141c;
+  flex-shrink: 0; position: relative;
+}
+
+.tfh-fade-in { animation: tfhFade 0.25s ease both; }
+@keyframes tfhFade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+.tfh-col-drop { background: var(--raised) !important; border-color: var(--accent) !important; }
+
+.tfh-task-card { transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease; }
+.tfh-task-card:hover { transform: translateY(-2px); border-color: var(--text-faint); box-shadow: 0 8px 24px -12px rgba(0, 0, 0, 0.5); }
+
+/* Sidebar resize handle. Sits on the right edge, wider than the border it
+   covers so there's something to actually grab. */
+.tfh-sidebar-resizer {
+  position: absolute; top: 0; right: -3px; bottom: 0; width: 7px;
+  cursor: col-resize; z-index: 30; background: transparent;
+  transition: background 0.12s ease;
+}
+.tfh-sidebar-resizer:hover,
+.tfh-sidebar-resizer.active,
+.tfh-sidebar-resizer:focus-visible { background: var(--accent); outline: none; }
+
+/* While dragging: kill text selection across the page, and keep the resize
+   cursor even when the pointer outruns the handle. */
+body.tfh-resizing { user-select: none; cursor: col-resize; }
+body.tfh-resizing * { cursor: col-resize !important; }
+
+@media (max-width: 860px) {
+  /* The sidebar is a slide-over sheet at this width, so a resize handle
+     would be meaningless. */
+  .tfh-sidebar-resizer { display: none; }
+}
+
+/* Drop overlay for the Files page. Covers the whole view while a drag is in
+   progress so the target is unmissable, and is pointer-events:none so it
+   can't itself swallow the drop event it's advertising. */
+.tfh-dropzone {
+  position: absolute; inset: 0; z-index: 20; pointer-events: none;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  border: 2px dashed var(--accent); border-radius: 16px;
+  background: var(--accent-soft);
+  backdrop-filter: blur(1px);
+  animation: tfhFade 0.12s ease both;
+}
+
+/* Rename/delete actions on a sidebar project — kept out of the way until
+   you're on the row, so the sidebar stays a list of projects rather than a
+   list of buttons. Always visible on touch, where there's no hover. */
+/* The actions FLOAT over the end of the row instead of reserving width, so
+   a project name gets the whole row until you point at it — with three
+   actions (file away, edit, delete) the reserved space was eating half the
+   name in a default-width sidebar. */
+.tfh-project-row { position: relative; }
+.tfh-project-actions {
+  position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+  padding: 1px 2px; border-radius: 7px;
+  background: var(--raised); box-shadow: -10px 0 10px -4px var(--raised);
+  opacity: 0; pointer-events: none; transition: opacity 0.12s ease;
+}
+.tfh-project-row:hover .tfh-project-actions,
+.tfh-project-row:focus-within .tfh-project-actions { opacity: 1; pointer-events: auto; }
+@media (hover: none) {
+  /* Touch: no hover, so the actions sit in the row as before. */
+  .tfh-project-actions { position: static; transform: none; opacity: 1; pointer-events: auto; background: none; box-shadow: none; }
+}
+
+/* Global search in the top bar. Sized to sit between the date and the
+   action buttons without crowding either. */
+.tfh-search-wrap {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--raised); border: 1px solid var(--line); border-radius: 10px;
+  padding: 6px 10px; width: 100%; min-width: 0;
+  transition: border-color 0.15s ease;
+}
+.tfh-search-wrap:focus-within { border-color: var(--accent); }
+.tfh-search-input {
+  flex: 1; min-width: 0; background: transparent; border: none; outline: none;
+  color: var(--text); font-size: 12.5px;
+}
+.tfh-search-input::placeholder { color: var(--text-faint); }
+.tfh-search-input:focus { outline: none; }
+
+.tfh-search-result {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 7px 10px; border-radius: 8px; border: none;
+  color: var(--text); text-align: left; cursor: pointer;
+}
+
+/* Account menu — the avatar control in the top bar. A pill rather than a
+   plain icon button so it reads as "this is you", and so the name has a
+   container to sit in at wide widths. */
+.tfh-account-trigger {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 8px 4px 4px;
+  background: transparent; border: 1px solid transparent; border-radius: 999px;
+  color: var(--text); cursor: pointer; max-width: 220px;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.tfh-account-trigger:hover { background: var(--raised); border-color: var(--line); }
+.tfh-account-trigger.open { background: var(--raised); border-color: var(--accent); }
+.tfh-account-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tfh-account-name {
+  font-size: 12.5px; font-weight: 600; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.tfh-account-item {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 8px 10px; border-radius: 8px; border: none; background: transparent;
+  color: var(--text); font-size: 12.5px; font-weight: 500;
+  text-align: left; cursor: pointer; transition: background 0.12s ease;
+}
+.tfh-account-item:hover { background: var(--raised); }
+.tfh-account-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tfh-account-item.danger { color: var(--pri-high); }
+.tfh-account-item.danger:hover { background: var(--pri-high); color: #fff; }
+
+/* Agenda rows (dashboard + Team Collabs) are clickable — tasks open their
+   dialog, logged activities open their detail. Without a hover state
+   there's nothing telling you the row does anything. */
+.tfh-agenda-row { transition: background 0.12s ease; }
+.tfh-agenda-row:hover { background: var(--raised); }
+.tfh-agenda-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.tfh-checkbox {
+  width: 16px; height: 16px; border-radius: 5px; border: 1.5px solid var(--line);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0; background: var(--raised); transition: all 0.12s ease;
+}
+.tfh-checkbox.checked { background: var(--accent); border-color: var(--accent); }
+
+/* Switching appearance cross-fades for a moment instead of snapping. The
+   class is put on <html> by ThemeContext only for the duration of a change —
+   leaving colour transitions on permanently would make every hover lag. */
+html.tfh-appearance-changing,
+html.tfh-appearance-changing *,
+html.tfh-appearance-changing *::before,
+html.tfh-appearance-changing *::after {
+  transition: background-color 0.24s ease, border-color 0.24s ease, color 0.24s ease, fill 0.24s ease, stroke 0.24s ease !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  html.tfh-appearance-changing, html.tfh-appearance-changing * { transition: none !important; }
+}
+
+.tfh-modal-backdrop {
+  position: fixed; inset: 0; background: var(--backdrop);
+  backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center;
+  z-index: 50; padding: 20px; animation: tfhFade 0.15s ease both;
+}
+
+.tfh-flow-bar { display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: var(--raised); }
+.tfh-flow-seg { transition: width 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
+
+.tfh-badge-dot {
+  position: absolute; top: -2px; right: -2px; width: 9px; height: 9px;
+  border-radius: 999px; background: var(--pri-high); border: 2px solid var(--panel);
+}
+
+.tfh-pulse { animation: tfhPulse 1.6s ease-in-out infinite; }
+@keyframes tfhPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+.tfh-dashboard-columns { display: flex; gap: 22px; align-items: flex-start; }
+
+/* The time/date gutter on an agenda row. A fixed width plus right alignment
+   is what makes the titles line up: "9:00 AM" and "11:00 AM – 12:00 PM" are
+   wildly different widths, so a shrink-to-fit gutter left every title
+   starting at a different x — which is what "the time looks haphazard"
+   was. tabular-nums stops 1s and 7s from shifting things too. */
+/* "Assigned by" — a face, a quiet label and a name, as one pill. The avatar
+   does the recognising, so the name can stay small; it sits at the right end
+   of the row so attribution lines up down the card instead of jostling after
+   titles of different lengths. */
+/* Project search — sits in the sidebar between "New project" and the list.
+   Styled as one field rather than an icon plus a box so it reads as a single
+   control in a narrow column. */
+.tfh-project-search {
+  display: flex; align-items: center; gap: 6px;
+  margin: 0 4px 6px; padding: 5px 8px;
+  border: 1px solid var(--line); border-radius: 9px;
+  background: var(--raised);
+  transition: border-color 0.12s ease;
+}
+.tfh-project-search:focus-within { border-color: var(--accent); }
+.tfh-project-search-input {
+  flex: 1; min-width: 0; border: none; background: none; outline: none;
+  color: var(--text); font-size: 12px; font-family: inherit; padding: 0;
+}
+.tfh-project-search-input::placeholder { color: var(--text-faint); }
+.tfh-project-search-clear {
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; background: none; cursor: pointer; padding: 2px;
+  color: var(--text-faint); border-radius: 5px; flex-shrink: 0;
+}
+.tfh-project-search-clear:hover { color: var(--text); background: var(--panel); }
+
+.tfh-assigned-by {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-left: auto; flex-shrink: 0;
+  padding: 2px 8px 2px 3px; border-radius: 999px;
+  background: var(--raised); border: 1px solid var(--line);
+  max-width: 190px; overflow: hidden;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.tfh-agenda-row:hover .tfh-assigned-by { border-color: var(--accent); background: var(--accent-soft); }
+.tfh-assigned-by-label {
+  font-size: 9.5px; letter-spacing: 0.4px; text-transform: uppercase;
+  color: var(--text-faint); font-weight: 600; flex-shrink: 0;
+}
+.tfh-assigned-by-name {
+  font-size: 11px; font-weight: 600; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tfh-agenda-row:hover .tfh-assigned-by-name { color: var(--text); }
+
+/* The Team column is a fraction of the dashboard's width and the user can
+   drag it narrower still, so the label goes and the name is trimmed harder
+   there — the avatar already carries the recognition. */
+.tfh-team-column .tfh-assigned-by { max-width: 132px; padding-left: 2px; }
+.tfh-team-column .tfh-assigned-by-label { display: none; }
+.tfh-team-column .tfh-assigned-by-name { font-size: 10.5px; }
+
+/* Narrow screens: the name gives way and the avatar carries it alone — the
+   row's title matters more than the attribution. */
+@media (max-width: 720px) {
+  .tfh-assigned-by-label, .tfh-assigned-by-name { display: none; }
+  .tfh-assigned-by { padding: 2px; }
+}
+
+.tfh-agenda-time {
+  /* min-width, NOT width. A fixed width plus white-space:nowrap doesn't clip
+     an over-long range — it overflows the box and prints straight over the
+     title next to it ("11:00 AM – 12:00 PResearch Collab"). min-width keeps
+     the column aligned for the times that fit and lets a long range push the
+     title along instead of colliding with it. padding-right guarantees a gap
+     even at the widest. */
+  min-width: 124px; width: auto; flex-shrink: 0; flex-grow: 0;
+  text-align: right; white-space: nowrap; padding-right: 2px;
+  font-size: 11.5px; margin-top: 1px; font-variant-numeric: tabular-nums;
+}
+/* The Team column is much narrower than the dashboard's own cards, so the
+   gutter there is sized down rather than eating half the row. */
+.tfh-team-column .tfh-agenda-time { min-width: 104px; width: auto; font-size: 10.5px; }
+
+/* The draggable divider between "mine" and the Team column. Same behaviour
+   as the sidebar handle, but it moves a split rather than one edge. */
+.tfh-column-resizer {
+  align-self: stretch; width: 9px; flex-shrink: 0; cursor: col-resize;
+  border-radius: 5px; background: transparent; border: none; padding: 0;
+  transition: background 0.12s ease; position: relative;
+}
+.tfh-column-resizer::after {
+  content: ""; position: absolute; top: 4px; bottom: 4px; left: 4px;
+  width: 1px; background: var(--line);
+}
+.tfh-column-resizer:hover, .tfh-column-resizer.active,
+.tfh-column-resizer:focus-visible { background: var(--accent-soft); outline: none; }
+.tfh-column-resizer:hover::after, .tfh-column-resizer.active::after { background: var(--accent); }
+.tfh-show-mobile-only { display: none; }
+
+@media (max-width: 860px) {
+  /* !important beats the inline width the resize handle writes: at this
+     size the sidebar is a slide-over sheet, and a dragged desktop width
+     would make it either a sliver or wider than the screen. */
+  .tfh-sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 40; width: 244px !important; transform: translateX(-100%); transition: transform 0.2s ease; }
+  .tfh-sidebar.open { transform: translateX(0); }
+  .tfh-board-grid { grid-auto-flow: column; grid-auto-columns: 82%; }
+  .tfh-hide-mobile { display: none !important; }
+  .tfh-show-mobile-only { display: inline-flex !important; }
+  /* Team activities is the first child now (desktop: left column) and
+     mine is second (desktop: right column) — plain column direction on
+     mobile keeps that same top-to-bottom order, team reads first. */
+  .tfh-dashboard-columns { flex-direction: column; gap: 26px; }
+  /* Stacked: there is no split to drag, and the columns take the full
+     width regardless of the stored percentage. */
+  .tfh-column-resizer { display: none; }
+  .tfh-dashboard-columns > div { flex-basis: auto !important; }
+  .tfh-agenda-time { min-width: 96px; width: auto; }
+}
+
+/* ============================================================ */
+/* Interaction & motion layer — purposeful, not decorative:      */
+/* every animation here signals something (state changed,        */
+/* something arrived, this is now open) rather than just moving   */
+/* for its own sake. Respects prefers-reduced-motion throughout.  */
+/* ============================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Tactile press feedback on every button — small enough to feel
+   responsive, not bouncy. */
+.tfh-btn:active:not(:disabled) { transform: scale(0.96); }
+.tfh-btn-accent:active:not(:disabled) { transform: scale(0.96); }
+
+/* Modal entrance — the backdrop already fades; the card itself
+   gets a subtle scale-up so opening a dialog feels like it has
+   weight, not just a flat swap. */
+@keyframes tfhPopIn {
+  from { opacity: 0; transform: scale(0.96) translateY(6px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+.tfh-modal-card { animation: tfhPopIn 0.22s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* Checkbox toggle — a quick overshoot-and-settle on check, so
+   marking something done has a small moment of payoff. */
+@keyframes tfhCheckPop {
+  0% { transform: scale(0.7); }
+  55% { transform: scale(1.15); }
+  100% { transform: scale(1); }
+}
+.tfh-checkbox.checked { animation: tfhCheckPop 0.28s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+
+/* Sliding active indicator on the sidebar, instead of an instant
+   background swap — reinforces which view you're actually in. */
+.tfh-nav-item { position: relative; overflow: hidden; }
+.tfh-nav-item::before {
+  content: ""; position: absolute; left: 0; top: 50%; height: 0; width: 3px;
+  background: var(--accent); border-radius: 0 3px 3px 0; transform: translateY(-50%);
+  transition: height 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.tfh-nav-item.active::before { height: 60%; }
+
+/* A card that just changed via a realtime update from someone else
+   — a brief highlight so live collaboration is visibly alive,
+   not just silently correct. */
+@keyframes tfhFlash {
+  0% { box-shadow: 0 0 0 0 var(--accent-soft); border-color: var(--accent); }
+  100% { box-shadow: 0 0 0 10px transparent; border-color: var(--line); }
+}
+.tfh-just-updated { animation: tfhFlash 1.1s ease-out both; }
+
+/* Notification bell rings briefly when something new arrives,
+   rather than the badge just silently appearing. */
+@keyframes tfhRing {
+  0%, 100% { transform: rotate(0); }
+  15% { transform: rotate(14deg); }
+  30% { transform: rotate(-12deg); }
+  45% { transform: rotate(8deg); }
+  60% { transform: rotate(-6deg); }
+  75% { transform: rotate(3deg); }
+}
+.tfh-bell-ring { animation: tfhRing 0.55s ease-in-out both; transform-origin: top center; }
+
+/* Stat numbers get a small pop when their value changes, instead
+   of silently swapping — draws the eye to what moved. */
+@keyframes tfhNumberPop {
+  0% { transform: scale(1); }
+  40% { transform: scale(1.12); }
+  100% { transform: scale(1); }
+}
+.tfh-number-pop { animation: tfhNumberPop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) both; display: inline-block; }
+
+/* Skeleton loading shimmer — replaces a bare spinner in list-shaped
+   content so the layout doesn't jump once data arrives. */
+@keyframes tfhShimmer { 0% { background-position: -300px 0; } 100% { background-position: 300px 0; } }
+.tfh-skeleton {
+  background: linear-gradient(90deg, var(--raised) 25%, var(--line) 37%, var(--raised) 63%);
+  background-size: 600px 100%; animation: tfhShimmer 1.4s ease-in-out infinite; border-radius: 8px;
+}
+
+/* Dragging a task card — lift and tilt slightly so the drag feels
+   physical, settle handled by the drop-zone pulse below. */
+.tfh-dragging { opacity: 0.55; transform: scale(0.98) rotate(-1deg); }
+.tfh-col-drop { animation: tfhDropPulse 0.9s ease-in-out infinite; }
+@keyframes tfhDropPulse {
+  0%, 100% { background: var(--raised); border-color: var(--accent); }
+  50% { background: var(--accent-soft); border-color: var(--accent); }
+}
+
+/* Expanding content (subtask detail, milestone form, etc.) fades
+   and settles in rather than snapping open. */
+@keyframes tfhExpandIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+.tfh-expand-in { animation: tfhExpandIn 0.18s ease both; }
+
+/* Roadmap bars grow in from the left on first paint — the one
+   place a "for its own sake" animation earns its keep, since a
+   timeline visually filling in reads as the plan taking shape. */
+.tfh-roadmap-bar { transition: width 0.7s cubic-bezier(0.16, 1, 0.3, 1), left 0.7s cubic-bezier(0.16, 1, 0.3, 1); }
+
+/* Staggered entrance for board/list items — each card a beat behind
+   the last, capped so a long list doesn't take forever to finish. */
+.tfh-stagger { animation: tfhFade 0.3s ease both; }
+.tfh-stagger:nth-child(1) { animation-delay: 0.02s; }
+.tfh-stagger:nth-child(2) { animation-delay: 0.05s; }
+.tfh-stagger:nth-child(3) { animation-delay: 0.08s; }
+.tfh-stagger:nth-child(4) { animation-delay: 0.11s; }
+.tfh-stagger:nth-child(5) { animation-delay: 0.14s; }
+.tfh-stagger:nth-child(n+6) { animation-delay: 0.16s; }
+
+/* Cards that are meant to be clicked (not every .tfh-card is) get
+   the same hover lift as a task card, applied deliberately rather
+   than blanket-applied to every panel on screen. */
+.tfh-card-interactive { transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease; cursor: pointer; }
+.tfh-card-interactive:hover { transform: translateY(-2px); border-color: var(--text-faint); box-shadow: 0 8px 24px -12px rgba(0, 0, 0, 0.5); }
+
+/* View switches (Dashboard -> Board -> Roadmap, etc.) already use
+   tfh-fade-in with the keyframe defined above — a touch more life
+   without overshooting. */
+
+/* ============================================================ */
+/* Appearance panel — theme tiles and accent swatches, after the */
+/* macOS System Settings pane.                                   */
+/* ============================================================ */
+.tfh-appearance {
+  position: absolute; right: 0; top: 44px; z-index: 30;
+  width: 318px; padding: 14px 14px 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+.tfh-appearance-heading {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--text-faint); margin-bottom: 8px;
+}
+.tfh-appearance-themes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.tfh-theme-tile {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  background: none; border: none; padding: 0; cursor: pointer; color: var(--text-dim);
+  font: inherit;
+}
+.tfh-theme-tile-preview {
+  display: block; width: 100%; aspect-ratio: 3 / 2; border-radius: 7px; overflow: hidden;
+  /* Two rings: a hairline so every tile has an edge on any background, and
+     the accent ring for the selected one, offset so it never sits on top of
+     the preview itself. */
+  box-shadow: 0 0 0 1px var(--line);
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+.tfh-theme-tile:hover .tfh-theme-tile-preview { transform: translateY(-1px); }
+.tfh-theme-tile.active .tfh-theme-tile-preview { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
+.tfh-theme-tile:focus-visible { outline: none; }
+.tfh-theme-tile:focus-visible .tfh-theme-tile-preview { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
+.tfh-theme-tile-label { font-size: 11.5px; font-weight: 500; }
+.tfh-theme-tile.active .tfh-theme-tile-label { color: var(--text); font-weight: 600; }
+.tfh-appearance-hint { font-size: 11px; color: var(--text-faint); margin-top: 8px; min-height: 14px; }
+
+/* Ten presets plus custom on ONE line, as macOS draws it: 11 × 18px with
+   8px gaps is 278px, inside the panel's 290px content width. */
+.tfh-accent-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tfh-accent-swatch {
+  position: relative; width: 18px; height: 18px; border-radius: 999px; flex-shrink: 0;
+  border: none; padding: 0; cursor: pointer; background: var(--swatch);
+  /* A faint inner edge keeps pale swatches (yellow, graphite) from melting
+     into a light panel. */
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+  transition: transform 0.12s ease, box-shadow 0.15s ease;
+}
+.tfh-accent-swatch:hover { transform: scale(1.12); }
+/* Selected: the macOS treatment — a ring in the colour itself, separated
+   from the swatch by a gap, and a white dot in the middle. */
+.tfh-accent-swatch.active {
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12), 0 0 0 2px var(--panel), 0 0 0 4px var(--swatch);
+}
+.tfh-accent-swatch.active::after {
+  content: ""; position: absolute; inset: 0; margin: auto; width: 6px; height: 6px;
+  border-radius: 999px; background: #fff; box-shadow: 0 0 1px rgba(0, 0, 0, 0.4);
+}
+.tfh-accent-swatch:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--text-dim); }
+
+/* Custom: a colour wheel until a custom colour is chosen, then that colour
+   with a thin wheel ring so it still reads as "the custom one". */
+.tfh-accent-swatch.custom {
+  background: conic-gradient(#ff3b30, #ff9500, #ffcc00, #34c759, #30b0c7, #007aff, #af52de, #ff2d55, #ff3b30);
+  display: inline-block;
+}
+.tfh-accent-swatch.custom.active {
+  background: radial-gradient(circle, var(--swatch) 0 5.5px, transparent 6px),
+              conic-gradient(#ff3b30, #ff9500, #ffcc00, #34c759, #30b0c7, #007aff, #af52de, #ff2d55, #ff3b30);
+}
+.tfh-accent-swatch.custom input[type="color"] {
+  position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer;
+  border: none; padding: 0;
+}
+.tfh-appearance-accent-name { font-size: 12px; color: var(--text-dim); margin-top: 9px; min-height: 16px; }
+
+/* Segmented control for the tint level — one track, the selected segment
+   raised on it, the way macOS draws a small multi-way choice. */
+.tfh-segmented {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px;
+  padding: 2px; border-radius: 8px; background: var(--raised);
+  border: 1px solid var(--line);
+}
+.tfh-segment {
+  border: none; background: transparent; cursor: pointer; font: inherit;
+  font-size: 11.5px; font-weight: 500; color: var(--text-dim);
+  padding: 5px 0; border-radius: 6px;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.tfh-segment:hover { color: var(--text); }
+.tfh-segment.active {
+  background: var(--panel); color: var(--text); font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18), 0 0 0 1px var(--line);
+}
+.tfh-segment:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.tfh-appearance-footer {
+  display: flex; align-items: flex-end; gap: 10px; margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 10.5px; line-height: 1.45; color: var(--text-faint);
+}
+.tfh-appearance-footer > span { flex: 1; }
+.tfh-appearance-reset {
+  flex-shrink: 0; background: none; border: none; padding: 2px 0; cursor: pointer;
+  font: inherit; font-size: 11.5px; font-weight: 600; color: var(--accent);
+}
+.tfh-appearance-reset:hover { text-decoration: underline; }
+
+@media (max-width: 520px) {
+  .tfh-appearance { position: fixed; left: 12px; right: 12px; top: 64px; width: auto; }
+}
+
+/* ---------- Milestones: the form the Chief drew, and the list ---------- */
+/* Three columns: Date | Title | Project, then Details | Link name | URL.
+   Collapses to one column on a phone without any of it being lost. */
+.tfh-milestone-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 14px;
+  align-items: start;
+}
+@media (max-width: 860px) {
+  .tfh-milestone-grid { grid-template-columns: 1fr; }
+}
+.tfh-milestone-row {
+  display: flex; gap: 16px; align-items: flex-start;
+  padding: 14px 16px;
+  border-top: 1px solid var(--line);
+}
+.tfh-milestone-row:first-child { border-top: none; }
+.tfh-milestone-row:hover { background: var(--raised); }
+.tfh-milestone-row.past .tfh-milestone-when { opacity: 0.85; }
+.tfh-milestone-when { width: 150px; flex-shrink: 0; padding-top: 1px; }
+@media (max-width: 640px) {
+  .tfh-milestone-row { flex-wrap: wrap; gap: 6px 12px; }
+  .tfh-milestone-when { width: 100%; }
+}
+.tfh-milestone-link {
+  background: var(--accent-soft); color: var(--accent); text-decoration: none;
+  max-width: 300px; gap: 5px;
+}
+.tfh-milestone-link:hover { text-decoration: underline; }
+
+/* ---------- Completed Projects folder + drag targets ---------- */
+.tfh-completed-folder {
+  display: flex; align-items: center; gap: 2px; border-radius: 9px;
+}
+.tfh-completed-list {
+  display: flex; flex-direction: column; gap: 2px;
+  margin-left: 12px; padding-left: 6px;
+  border-left: 1px solid var(--line);
+}
+/* While a project is held, the folder it can go to is outlined, and lights
+   up when the pointer is over it — so the target is obvious before you let go. */
+.tfh-drop-target {
+  outline: 1px dashed var(--line);
+  outline-offset: -1px;
+  transition: background 0.12s ease, outline-color 0.12s ease;
+}
+.tfh-drop-target.hot {
+  outline: 2px solid var(--success);
+  background: var(--success-soft);
+}
+.tfh-sidebar-notice {
+  display: flex; align-items: center; gap: 6px;
+  margin: 4px 2px; padding: 6px 8px 6px 10px;
+  border-radius: 8px; background: var(--raised);
+  font-size: 11px; color: var(--text-dim); line-height: 1.4;
+  animation: tfhExpandIn 0.2s ease;
+}
+
+/* ---------- Task reminders (Google Calendar style rows) ---------- */
+.tfh-reminder-row {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.tfh-reminder-row .tfh-input { padding-top: 6px; padding-bottom: 6px; }
+/* The "fires at" preview always sits on its own line under the controls, so
+   the row itself never wraps and its remove button stays on the same line. */
+.tfh-reminder-row { padding: 4px 0 6px; border-bottom: 1px dashed var(--line); }
+.tfh-reminder-row:last-child { border-bottom: none; }
+.tfh-reminder-when { order: 10; flex-basis: 100%; font-size: 11.5px; padding-left: 2px; }
+
+/* ---------- Super Admin page ---------- */
+.tfh-onetime {
+  padding: 14px 16px; border-radius: 12px;
+  background: var(--accent-soft); border: 1px solid var(--accent);
+}
+.tfh-sa-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.tfh-sa-table { display: flex; flex-direction: column; }
+.tfh-sa-row {
+  display: grid; grid-template-columns: minmax(160px, 2fr) 0.7fr 0.7fr 0.8fr 1.2fr 0.6fr;
+  gap: 10px; align-items: center; padding: 9px 4px; font-size: 13px;
+  border-top: 1px solid var(--line);
+}
+.tfh-sa-head { border-top: none; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-faint); }
+.tfh-sa-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 14px; }
+.tfh-sa-user {
+  display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap;
+  padding: 12px 4px; border-top: 1px solid var(--line);
+}
+.tfh-sa-user:first-child { border-top: none; }
+.tfh-sa-membership {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 4px 2px 8px; border-radius: 999px;
+  background: var(--raised); font-size: 11.5px; color: var(--text-dim);
+}
+.tfh-sa-membership select, .tfh-sa-add {
+  background: transparent; border: none; color: var(--text); font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.tfh-sa-add { padding: 2px 8px; border: 1px dashed var(--line); border-radius: 999px; color: var(--accent); }
+@media (max-width: 760px) {
+  .tfh-sa-row { grid-template-columns: 1fr 1fr; }
+  .tfh-sa-head { display: none; }
+  .tfh-sa-form, .tfh-sa-stats { grid-template-columns: 1fr; }
+}

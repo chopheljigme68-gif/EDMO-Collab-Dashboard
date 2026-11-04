@@ -1,0 +1,8379 @@
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { Routes, Route, Navigate } from "react-router-dom";
+import {
+  LayoutDashboard, SquareKanban, Users, CalendarDays, Search, Plus, X, Check,
+  Flag, ChevronLeft, ChevronRight, Trash2, Menu,
+  Bell, BadgeCheck, Sun, Moon, LogOut, AlertTriangle, Loader2, RefreshCw,
+  UserPlus, ChevronDown, ChevronUp, Building2, Shield, FolderKanban, Lock,
+  FolderCheck, ArchiveRestore, Crown, KeyRound,
+  Paperclip, FileText, Image as ImageIcon, Download, Upload, Pencil, MessageSquare, FolderOpen, Link2, Clock, ClipboardList, NotebookPen, Table as TableIcon, CheckCircle2, UserX, Repeat, CalendarRange, Monitor, Sunset,
+} from "lucide-react";
+import {
+  LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
+  ResponsiveContainer, Cell,
+} from "recharts";
+
+import { useAuth } from "./context/AuthContext.jsx";
+import { useTheme } from "./context/ThemeContext.jsx";
+import { ACCENTS, TINT_LEVELS, accentLabel, themeSurfaces } from "./appearance.js";
+import { useWorkspace } from "./context/WorkspaceContext.jsx";
+import { useProject } from "./context/ProjectContext.jsx";
+import { api } from "./api.js";
+import { BRAND } from "./brand.js";
+import { connectSocket, getSocket } from "./socket.js";
+import Login from "./pages/Login.jsx";
+import Register from "./pages/Register.jsx";
+import ForgotPassword from "./pages/ForgotPassword.jsx";
+import ResetPassword from "./pages/ResetPassword.jsx";
+
+/* ------------------------------------------------------------------ */
+/* Constants                                                            */
+/* ------------------------------------------------------------------ */
+const STAGES = [
+  { id: "todo", label: "Tasks", color: "var(--stage-progress)" },
+  { id: "done", label: "Completed", color: "var(--stage-done)" },
+];
+// The Chief asked to drop Low/Medium/High and keep just one "Priority"
+// (urgent) flag. Rather than a destructive DB migration, we keep the
+// existing `priority` column but only ever use two values now: "high" for
+// urgent, "medium" for normal. Old rows with "low" still read fine (treated
+// as normal). PRIORITIES is kept for the rare place that still maps a raw
+// value to a colour.
+const PRIORITIES = {
+  low: { label: "Normal", color: "var(--pri-low)" },
+  medium: { label: "Normal", color: "var(--pri-medium)" },
+  high: { label: "Urgent", color: "var(--pri-high)" },
+};
+const isUrgent = (level) => level === "high";
+// Subtasks are switched off at the Chief's request ("not of much use for
+// now — we will reinstate in future if really required"). This hides every
+// subtask control; it does NOT touch data: existing subtasks stay in the
+// database, are kept on save, and still appear in the Word report. Flip this
+// to true to bring the whole feature back exactly as it was.
+const SUBTASKS_ENABLED = false;
+
+// Uploading files is switched off on purpose: the Chief wants everyone in the
+// habit of sharing the Google Drive link instead, so there is one copy of a
+// document, in Drive, rather than a stale upload here. Every "Add file" /
+// "Upload file" control and drop zone reads this flag. Files uploaded BEFORE
+// the switch are still listed, still open, and can still be removed — nothing
+// is hidden or lost. The upload endpoints are left in place on the server so
+// turning this back on is a one-line change.
+const FILE_UPLOADS_ENABLED = false;
+
+const NAV = [
+  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { id: "board", label: "Board", icon: SquareKanban },
+  { id: "files", label: "Files", icon: FolderOpen },
+  { id: "milestones", label: "Milestones", icon: Flag },
+  { id: "team", label: "Team", icon: Users },
+  { id: "calendar", label: "Calendar", icon: CalendarDays },
+  { id: "admin", label: "Admin Panel", icon: Shield },
+  // Shown only to a Super Admin (see visibleNav).
+  { id: "superadmin", label: "Super Admin", icon: Crown },
+];
+// The nav items grouped under DASHBOARD at the top of the sidebar, above the
+// project list. They render in NAV order: Dashboard, (Initiate
+// Collaboration), Board, Files.
+const TOP_NAV_IDS = ["dashboard", "activity", "board", "files"];
+
+const NOTIF_LABEL = {
+  assigned: "assigned you a task",
+  reassigned: "reassigned a task to you",
+  moved: "task moved",
+  shipped: "task shipped",
+  role: "role updated",
+  removed: "removed from workspace",
+  comment: "new comment",
+  link: "new link",
+  invited: "added to workspace",
+  due_soon: "due soon",
+  reminder: "reminder",
+};
+
+const POST_SUGGESTIONS = [
+  "Founder", "Director", "Manager", "Team Lead",
+  "Product Designer", "Product Manager", "Software Engineer", "QA Engineer",
+  "Marketing Lead", "Sales Lead", "Operations Lead", "Analyst",
+];
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                              */
+/* ------------------------------------------------------------------ */
+const memberById = (users, id) => users.find((u) => u.id === id);
+
+const formatTimeLabel = (hhmm) => {
+  if (!hhmm) return null;
+  const [h, m] = hhmm.split(":").map(Number);
+  const period = h >= 12 ? "PM" : "AM";
+  const hour12 = h % 12 === 0 ? 12 : h % 12;
+  return `${hour12}:${String(m).padStart(2, "0")} ${period}`;
+};
+
+// Matches the backend's own multer limit (20MB for task/subtask/project/
+// milestone files) — checked client-side too so an oversized file is
+// rejected instantly instead of after a slow upload attempt that was
+// always going to fail.
+// "9:00 AM – 11:00 AM" when an activity runs to an end time, just the start
+// when it doesn't. One helper so every surface renders a range identically
+// instead of each one re-deciding.
+const formatTimeRange = (start, end) => {
+  if (!start) return "";
+  return end ? `${formatTimeLabel(start)} – ${formatTimeLabel(end)}` : formatTimeLabel(start);
+};
+
+/* ------------------------------------------------------------------ */
+/* Logged-activity status — complete or pending                         */
+/* ------------------------------------------------------------------ */
+// A logged activity is a text block inside someone's day entry, so its
+// status lives on the block (`block.status`). Absent means "not marked
+// either way": entries written before this feature existed are left alone
+// rather than retro-labelled as pending.
+const ACTIVITY_STATUS = {
+  done: { label: "Complete", color: "var(--stage-done)", icon: CheckCircle2 },
+  pending: { label: "Pending", color: "var(--pri-medium)", icon: Clock },
+};
+
+const ActivityStatusChip = ({ status, size = 9.5 }) => {
+  const meta = ACTIVITY_STATUS[status];
+  if (!meta) return null;
+  const Icon = meta.icon;
+  return (
+    <span className="tfh-chip" style={{ fontSize: size, background: "var(--raised)", color: meta.color }}>
+      <Icon size={size + 1} /> {meta.label}
+    </span>
+  );
+};
+
+// The control itself. Two explicit buttons rather than one cycling toggle —
+// "mark it complete" and "mark it pending" are different intentions, and a
+// tri-state toggle makes you click through a state you didn't want. Clicking
+// the state it's already in clears it.
+const ActivityStatusPicker = ({ status, disabled, busy, onChange, compact }) => (
+  <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+    {Object.entries(ACTIVITY_STATUS).map(([key, meta]) => {
+      const active = status === key;
+      const Icon = meta.icon;
+      return (
+        <button
+          key={key} type="button" disabled={disabled || busy}
+          onClick={() => onChange(active ? null : key)}
+          className="tfh-btn"
+          aria-pressed={active}
+          title={disabled ? "Only the person who logged this can mark it" : active ? `Clear "${meta.label}"` : `Mark as ${meta.label}`}
+          style={{
+            fontSize: compact ? 10.5 : 11.5,
+            padding: compact ? "2px 7px" : "4px 9px",
+            gap: 5,
+            background: active ? "var(--raised)" : "transparent",
+            borderColor: active ? meta.color : "var(--line)",
+            color: active ? meta.color : "var(--text-dim)",
+            fontWeight: active ? 600 : 500,
+            opacity: disabled ? 0.55 : 1,
+          }}
+        >
+          <Icon size={compact ? 10 : 12} /> {meta.label}
+        </button>
+      );
+    })}
+  </div>
+);
+
+const MAX_FILE_MB = 20;
+const validateFiles = (fileList) => {
+  const files = Array.from(fileList || []);
+  const accepted = [];
+  const rejected = [];
+  for (const f of files) {
+    if (f.size > MAX_FILE_MB * 1024 * 1024) rejected.push(f.name);
+    else accepted.push(f);
+  }
+  return { accepted, rejected };
+};
+
+// A bare domain like "link.com" or "google.com" is what people almost
+// always mean when they skip the protocol — auto-correct it to https://
+// rather than reject it and make them retype the whole thing. Anything
+// that already looks like a URL (has "://" anywhere) is left exactly as
+// typed, so this never mangles an intentional http://, a mailto:, etc.
+const normalizeUrl = (raw) => {
+  const trimmed = (raw || "").trim();
+  if (!trimmed || trimmed.includes("://")) return trimmed;
+  return `https://${trimmed}`;
+};
+
+// "Today" as a YYYY-MM-DD string in the USER'S OWN timezone. The obvious
+// new Date().toISOString().slice(0,10) is a real bug for anyone east of
+// UTC (Bhutan is UTC+6): after ~6pm UTC it's already "tomorrow" in
+// toISOString even though it's still today locally, so an entry logged
+// late on the 28th would save/display under the 29th. Building the string
+// from the local date components avoids that entirely.
+const localDateStr = (date = new Date()) => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+};
+
+// Day arithmetic on a 'YYYY-MM-DD' string. Built at local noon so a DST
+// change can never land the result on the wrong calendar day.
+const shiftDateStr = (dateStr, days) => {
+  const d = new Date(`${dateStr}T12:00:00`);
+  d.setDate(d.getDate() + days);
+  return localDateStr(d);
+};
+
+/* ------------------------------------------------------------------ */
+/* Dates — always dd/mm/yyyy                                            */
+/* ------------------------------------------------------------------ */
+// A native <input type="date"> renders in the BROWSER's locale, so the same
+// app shows 09/15/2026 to one person and 15/09/2026 to another, with no way
+// to control it from the markup. For a Bhutanese government office that
+// reads day-first, the US order is a real source of misreading.
+//
+// So the visible field is a plain text input we format ourselves, always
+// dd/mm/yyyy. The native picker is still there behind a calendar button, so
+// nobody loses the calendar or the mobile date wheel — it's just not what
+// renders the value.
+const isoToDisplay = (iso) => {
+  if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return "";
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+};
+
+// Accepts "5/9/26", "05/09/2026", "5-9-2026" and so on. Two-digit years map
+// into 2000-2099: this app's dates are deadlines and logs, never birthdays,
+// so a 19xx reading would always be wrong.
+const displayToIso = (text) => {
+  const m = (text || "").trim().match(/^(\d{1,2})\s*[\/\-.]\s*(\d{1,2})\s*[\/\-.]\s*(\d{2}|\d{4})$/);
+  if (!m) return null;
+  const day = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  let year = parseInt(m[3], 10);
+  if (m[3].length === 2) year += 2000;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const iso = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  // Reject 31/02 and friends: the Date round-trip catches any day that
+  // doesn't exist in that month.
+  const probe = new Date(`${iso}T12:00:00`);
+  if (probe.getUTCDate && probe.getDate() !== day) return null;
+  return iso;
+};
+
+const DateField = ({ value, onChange, disabled, id, min, max, ariaLabel, style }) => {
+  const [text, setText] = useState(() => isoToDisplay(value));
+  const [invalid, setInvalid] = useState(false);
+  const pickerRef = useRef(null);
+
+  // Follow the value when it changes from outside (a form reset, a different
+  // task opened into the same dialog) without fighting what's being typed.
+  useEffect(() => { setText(isoToDisplay(value)); setInvalid(false); }, [value]);
+
+  const commit = (raw) => {
+    const trimmed = (raw || "").trim();
+    if (!trimmed) { setInvalid(false); onChange(""); return; }
+    const iso = displayToIso(trimmed);
+    if (iso) { setInvalid(false); onChange(iso); setText(isoToDisplay(iso)); }
+    else setInvalid(true);
+  };
+
+  const openPicker = () => {
+    const el = pickerRef.current;
+    if (!el) return;
+    // showPicker() is the supported way in current Chrome/Edge/Firefox;
+    // .click() is the fallback for browsers that don't have it yet.
+    if (typeof el.showPicker === "function") { try { el.showPicker(); return; } catch { /* fall through */ } }
+    el.click();
+  };
+
+  return (
+    <div style={{ position: "relative", ...style }}>
+      <input
+        id={id}
+        className="tfh-input"
+        inputMode="numeric"
+        placeholder="dd/mm/yyyy"
+        aria-label={ariaLabel || "Date (day/month/year)"}
+        disabled={disabled}
+        value={text}
+        onChange={(e) => { setText(e.target.value); setInvalid(false); }}
+        onBlur={(e) => commit(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commit(e.currentTarget.value); } }}
+        style={{ paddingRight: 34, opacity: disabled ? 0.7 : 1, borderColor: invalid ? "var(--pri-high)" : undefined }}
+      />
+      <button
+        type="button" disabled={disabled} onClick={openPicker}
+        aria-label="Open calendar"
+        style={{ position: "absolute", right: 4, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", padding: 5, display: "flex", cursor: disabled ? "default" : "pointer" }}
+      >
+        <CalendarDays size={14} color="var(--text-faint)" />
+      </button>
+      {/* The real date input: it drives the calendar/wheel but never renders
+          a value, so the browser's locale format is never on screen. */}
+      <input
+        ref={pickerRef} type="date" tabIndex={-1} aria-hidden="true" disabled={disabled}
+        value={value || ""} min={min} max={max}
+        onChange={(e) => onChange(e.target.value)}
+        style={{ position: "absolute", right: 8, bottom: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+      />
+      {invalid && <div style={{ fontSize: 11, color: "var(--pri-high)", marginTop: 4 }}>Use dd/mm/yyyy</div>}
+    </div>
+  );
+};
+
+const dueMeta = (dateStr, status) => {
+  if (status === "done") return { label: "Completed", tone: "var(--stage-done)" };
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const due = new Date(dateStr + "T00:00:00");
+  const diff = Math.round((due - today) / 86400000);
+  if (diff < 0) return { label: `${Math.abs(diff)}d overdue`, tone: "var(--pri-high)" };
+  if (diff === 0) return { label: "Due today", tone: "var(--pri-medium)" };
+  if (diff === 1) return { label: "Due tomorrow", tone: "var(--pri-medium)" };
+  return { label: `Due in ${diff}d`, tone: "var(--text-dim)" };
+};
+const timeAgo = (iso) => {
+  const diff = Math.max(0, Date.now() - new Date(iso).getTime());
+  const mins = Math.round(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+};
+
+/* ------------------------------------------------------------------ */
+/* Small shared pieces                                                  */
+/* ------------------------------------------------------------------ */
+const Logo = ({ size = 30 }) => (
+  <img src="/logo.png" alt={BRAND.appName} style={{ width: size, height: size, objectFit: "contain", flexShrink: 0 }} />
+);
+
+// Who is looking at the screen, and the roster to look people up in. A
+// context rather than props because "assigned by" appears on rows rendered
+// from half a dozen places, and threading these through every one of them
+// would be the kind of change that gets forgotten in exactly one spot.
+// Whose list a row is being rendered in — set by the person's own dashboard
+// sections and by each card in Team Members. Read by AssignedByChip, so the
+// "from …" attribution is judged against the right person on a shared
+// (two-assignee) activity. A context rather than a prop for the same reason
+// ViewerContext is one: the chip sits under half a dozen list components.
+const AgendaOwnerContext = React.createContext(null);
+
+const ViewerContext = React.createContext({ viewerId: null, membersById: new Map() });
+
+// Shared across all <Avatar> instances so the same person's photo is only
+// fetched once per session, however many task cards/avatars show them.
+const avatarUrlCache = new Map();
+
+const useAvatarPhoto = (member) => {
+  const [url, setUrl] = useState(() => (member?.avatarUrl && avatarUrlCache.get(member.id)) || null);
+  useEffect(() => {
+    if (!member?.avatarUrl) { setUrl(null); return; }
+    if (avatarUrlCache.has(member.id)) { setUrl(avatarUrlCache.get(member.id)); return; }
+    let cancelled = false;
+    api.getAvatarBlobUrl(member.id)
+      .then((blobUrl) => { avatarUrlCache.set(member.id, blobUrl); if (!cancelled) setUrl(blobUrl); })
+      // Cache the MISS too. Without this every remount of every avatar for a
+      // person with no photo fired another request, which is how one page
+      // produced two dozen failed requests for the same handful of people.
+      .catch(() => { avatarUrlCache.set(member.id, null); });
+    return () => { cancelled = true; };
+  }, [member?.id, member?.avatarUrl]);
+  return url;
+};
+
+// Call after a fresh avatar upload so every Avatar on screen picks up the new photo.
+const invalidateAvatarCache = (userId) => { avatarUrlCache.delete(userId); };
+
+const Avatar = ({ member, size = 28 }) => {
+  const photoUrl = useAvatarPhoto(member);
+  return (
+    <span
+      className="tfh-avatar"
+      title={member ? `${member.name}${member.role === "admin" ? " · Admin" : member.role === "lead" ? " · Lead" : ""}` : "Assigned to someone no longer on the team"}
+      style={{ width: size, height: size, background: member?.color || "var(--raised)", border: member ? undefined : "1px dashed var(--text-faint)", fontSize: size * 0.4, overflow: "hidden" }}
+    >
+      {photoUrl ? (
+        <img src={photoUrl} alt={member.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+      ) : member ? (
+        member.initials
+      ) : (
+        <UserX size={size * 0.55} color="var(--text-faint)" />
+      )}
+      {member?.role === "lead" && (
+        <BadgeCheck size={size * 0.42} color="var(--accent-ink)" fill="var(--accent)" style={{ position: "absolute", top: -size * 0.32, right: -size * 0.12 }} />
+      )}
+      {member?.role === "admin" && (
+        <Shield size={size * 0.4} color="#12141c" fill="var(--stage-done)" style={{ position: "absolute", top: -size * 0.3, right: -size * 0.14 }} />
+      )}
+    </span>
+  );
+};
+
+const PriorityChip = ({ level }) => {
+  // Only urgent tasks get a chip now; normal tasks show nothing, since the
+  // three-level Low/Medium/High system was dropped in favour of a single
+  // "Urgent" flag.
+  if (!isUrgent(level)) return null;
+  const p = PRIORITIES.high;
+  return (
+    <span className="tfh-chip" style={{ background: `${p.color}1E`, color: p.color, borderColor: `${p.color}40` }}>
+      <Flag size={11} /> Urgent
+    </span>
+  );
+};
+
+const MiniCheckbox = ({ checked, onClick, disabled }) => (
+  <button type="button" onClick={onClick} disabled={disabled} className={`tfh-checkbox ${checked ? "checked" : ""}`} style={disabled ? { opacity: 0.6, cursor: "default" } : undefined} aria-label="Toggle subtask">
+    {checked && <Check size={11} color="var(--accent-ink)" strokeWidth={3} />}
+  </button>
+);
+
+const Spinner = ({ size = 22 }) => <Loader2 className="tfh-pulse" size={size} color="var(--text-faint)" />;
+
+/* ------------------------------------------------------------------ */
+/* Task card + column                                                   */
+/* ------------------------------------------------------------------ */
+const TaskCard = ({ task, users, onOpen, onComplete, onReopen, canManage, currentUserId, showProject }) => {
+  const assignee = memberById(users, task.assigneeId);
+  const done = (task.subtasks || []).filter((s) => s.done).length;
+  const total = (task.subtasks || []).length;
+  const meta = dueMeta(task.due, task.status);
+  const isDone = task.status === "done";
+  // A manager can toggle any card's completion. A plain member can toggle
+  // only a card assigned to them — everyone else's tasks stay view-only.
+  const canModify = canManage || isAssignedTo(task, currentUserId) || task.createdBy === currentUserId;
+
+  return (
+    <div
+      className="tfh-card tfh-task-card tfh-stagger"
+      onClick={() => onOpen(task)}
+      style={{
+        padding: "12px 13px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 10,
+        // "Done" is a status, not a control — it stays success-green whatever
+        // accent the viewer has chosen. See --success in styles.css.
+        borderColor: isDone ? "var(--success)" : undefined,
+        background: isDone ? "var(--success-soft)" : undefined,
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+        <span style={{ fontSize: 13.5, fontWeight: 600, lineHeight: 1.35, color: isDone ? "var(--text-dim)" : "var(--text)" }}>{task.title}</span>
+        {canModify && (
+          <button
+            onClick={(e) => { e.stopPropagation(); isDone ? onReopen(task.id) : onComplete(task.id); }}
+            className="tfh-btn tfh-btn-ghost"
+            style={{ padding: 3, flexShrink: 0 }}
+            aria-label={isDone ? "Mark not done" : "Mark complete"}
+            title={isDone ? "Click to reopen" : "Mark complete"}
+          >
+            <CheckCircle2 size={16} color={isDone ? "var(--success)" : "var(--text-faint)"} fill={isDone ? "var(--success-soft)" : "none"} />
+          </button>
+        )}
+        {!canModify && isDone && <CheckCircle2 size={16} color="var(--success)" style={{ flexShrink: 0, marginTop: 1 }} />}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 6 }}>
+        {showProject && task.projectName && (
+          <span className="tfh-chip" style={{ background: "var(--raised)", color: "var(--text-dim)", maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <FolderKanban size={10} /> {task.projectName}
+          </span>
+        )}
+        {task.dueTime && (
+          <span className="tfh-chip tfh-mono" style={{ background: "var(--clock-soft)", color: "var(--clock)" }}>
+            <Clock size={10} /> {formatTimeRange(task.dueTime, task.endTime)}
+          </span>
+        )}
+        <PriorityChip level={task.priority} />
+        {(task.recurrence || task.recurrenceParentId) && (
+          <span
+            className="tfh-chip" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+            title={task.recurrence ? describeRecurrence(task.recurrence) : "Part of a repeating activity"}
+          >
+            <Repeat size={10} /> Repeats
+          </span>
+        )}
+        {task.reminderCount > 0 && task.status !== "done" && (
+          <span className="tfh-chip" style={{ background: "var(--raised)", color: "var(--text-dim)" }} title={`${task.reminderCount} reminder${task.reminderCount === 1 ? "" : "s"} set`}>
+            <Bell size={10} />
+          </span>
+        )}
+        {SUBTASKS_ENABLED && total > 0 && (
+          <span className="tfh-chip tfh-mono" style={{ background: "var(--raised)", color: "var(--text-dim)" }}>
+            {done}/{total}
+          </span>
+        )}
+        {task.attachmentCount > 0 && (
+          <span className="tfh-chip tfh-mono" style={{ background: "var(--raised)", color: "var(--text-dim)" }}>
+            <Paperclip size={10} /> {task.attachmentCount}
+          </span>
+        )}
+        <AssignedByChip task={task} compact />
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span style={{ fontSize: 11.5, color: isDone ? "var(--success)" : meta.tone, fontWeight: 500 }}>{meta.label}</span>
+        <Avatar member={assignee} size={24} />
+      </div>
+    </div>
+  );
+};
+
+const Column = ({ stage, tasks, users, onOpen, onAdd, onComplete, onReopen, canManage, canCreate, currentUserId, showProject }) => {
+  return (
+    <div className="tfh-card" style={{ padding: 12, display: "flex", flexDirection: "column", minHeight: 200 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "2px 4px 12px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ width: 8, height: 8, borderRadius: 999, background: stage.color }} />
+          <span style={{ fontSize: 13, fontWeight: 700 }}>{stage.label}</span>
+          <span className="tfh-mono" style={{ fontSize: 11, color: "var(--text-faint)" }}>{tasks.length}</span>
+        </div>
+        {canCreate && (
+          <button className="tfh-btn tfh-btn-ghost" style={{ padding: 5 }} onClick={() => onAdd(stage.id)} aria-label={`Add task to ${stage.label}`}>
+            <Plus size={14} />
+          </button>
+        )}
+      </div>
+      <div className="tfh-scrollbar-none" style={{ display: "flex", flexDirection: "column", gap: 8, minHeight: 60, borderRadius: 10, padding: 4, flex: 1 }}>
+        {tasks.length === 0 && (
+          <div style={{ fontSize: 12, color: "var(--text-faint)", textAlign: "center", padding: "18px 8px", border: "1px dashed var(--line)", borderRadius: 10 }}>
+            {canCreate ? "Nothing here — add one." : "Nothing here."}
+          </div>
+        )}
+        {tasks.map((t) => (
+          <TaskCard key={t.id} task={t} users={users} onOpen={onOpen} onComplete={onComplete} onReopen={onReopen} canManage={canManage} currentUserId={currentUserId} showProject={showProject} />
+        ))}
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Task dialog                                                          */
+/* ------------------------------------------------------------------ */
+const emptyDraft = (status, users, currentUserId, projectId) => ({
+  id: null, title: "", description: "", meetingNotes: "", status: status || "todo", priority: "medium",
+  // Today, not "three days out": almost everything logged here is being
+  // recorded on the day it happens or is about to. A default you have to
+  // correct on most entries is worse than no default.
+  assigneeId: currentUserId || users[0]?.id || "", assignee2Id: null, due: localDateStr(new Date()),
+  dueTime: "", endTime: "", subtasks: [], pendingLinks: [], pendingFiles: [], projectId: projectId || "",
+  recurrence: null,
+  // Reminder rows as the editor shows them; [] for a new task. On an
+  // existing task this starts null (loading) and is filled from the server.
+  reminderRows: [], originalReminders: [], remindersForSeries: false,
+});
+
+const DeleteButton = ({ onConfirm }) => {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => { if (!armed) return; const t = setTimeout(() => setArmed(false), 2500); return () => clearTimeout(t); }, [armed]);
+  return armed ? (
+    <button className="tfh-btn tfh-btn-danger" onClick={onConfirm}><Trash2 size={13} /> Click to confirm</button>
+  ) : (
+    <button className="tfh-btn tfh-btn-ghost" style={{ color: "var(--text-dim)" }} onClick={() => setArmed(true)}>
+      <Trash2 size={13} /> Delete task
+    </button>
+  );
+};
+
+const AttachmentRow = ({ attachment, workspaceId, projectId, taskId, onRemove }) => {
+  const isImage = attachment.mimeType.startsWith("image/");
+  const [blobUrl, setBlobUrl] = useState(null);
+
+  useEffect(() => {
+    let objectUrl;
+    if (isImage) {
+      api.getAttachmentBlobUrl(workspaceId, projectId, taskId, attachment.id)
+        .then((url) => { objectUrl = url; setBlobUrl(url); })
+        .catch(() => {});
+    }
+    return () => { if (objectUrl) URL.revokeObjectURL(objectUrl); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attachment.id]);
+
+  const [dlError, setDlError] = useState("");
+  const openOrDownload = async () => {
+    setDlError("");
+    try {
+      const url = await api.getAttachmentBlobUrl(workspaceId, projectId, taskId, attachment.id);
+      const a = document.createElement("a");
+      a.href = url;
+      if (isImage) a.target = "_blank"; else a.download = attachment.fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } catch (err) {
+      // Don't swallow it — tell the user why. A 404 here almost always means
+      // the file was wiped from the server's disk (free-tier hosts reset
+      // uploaded files on every redeploy), which is exactly why pasting a
+      // Google-Drive link is the more reliable option for now.
+      const msg = /404/.test(err.message)
+        ? "This file is no longer on the server (it was cleared by a server restart). Please re-upload it or paste a link instead."
+        : (err.message || "Couldn't open this file. Please try again.");
+      setDlError(msg);
+    }
+  };
+
+  const sizeLabel = attachment.sizeBytes > 1024 * 1024
+    ? `${(attachment.sizeBytes / 1024 / 1024).toFixed(1)} MB`
+    : `${Math.max(1, Math.round(attachment.sizeBytes / 1024))} KB`;
+
+  return (
+    <div>
+    <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "6px 8px", borderRadius: 8, background: "var(--raised)" }}>
+      {isImage ? (
+        blobUrl ? (
+          <img src={blobUrl} alt={attachment.fileName} onClick={openOrDownload} style={{ width: 32, height: 32, borderRadius: 6, objectFit: "cover", flexShrink: 0, cursor: "pointer" }} />
+        ) : (
+          <div style={{ width: 32, height: 32, borderRadius: 6, background: "var(--panel)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            <ImageIcon size={14} color="var(--text-faint)" />
+          </div>
+        )
+      ) : (
+        <div style={{ width: 32, height: 32, borderRadius: 6, background: "var(--panel)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          <FileText size={14} color="var(--text-faint)" />
+        </div>
+      )}
+      <button type="button" onClick={openOrDownload} style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+        <div style={{ fontSize: 12.5, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{attachment.fileName}</div>
+        <div style={{ fontSize: 10.5, color: "var(--text-faint)" }}>{sizeLabel}{attachment.uploaderName ? ` · ${attachment.uploaderName}` : ""}</div>
+      </button>
+      <button type="button" onClick={openOrDownload} className="tfh-btn tfh-btn-ghost" style={{ padding: 5 }} aria-label="Download"><Download size={13} color="var(--text-faint)" /></button>
+      {onRemove && <button type="button" onClick={onRemove} className="tfh-btn tfh-btn-ghost" style={{ padding: 5 }} aria-label="Remove attachment"><X size={13} color="var(--text-faint)" /></button>}
+    </div>
+    {dlError && <div style={{ fontSize: 11, color: "var(--pri-high)", padding: "4px 8px 0", lineHeight: 1.4 }}>{dlError}</div>}
+    </div>
+  );
+};
+
+const Attachments = ({ workspaceId, projectId, taskId, canAttach }) => {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+  const fileInputRef = useRef(null);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const { attachments } = await api.getAttachments(workspaceId, projectId, taskId);
+      setItems(attachments);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, [taskId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setUploading(true);
+    setError("");
+    try {
+      for (const file of files) {
+        await api.uploadAttachment(workspaceId, projectId, taskId, file);
+      }
+      await load();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const removeAttachment = async (id) => {
+    try {
+      await api.deleteAttachment(workspaceId, projectId, taskId, id);
+      setItems((prev) => prev.filter((a) => a.id !== id));
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  // With uploads off, this section only exists to keep files uploaded before
+  // the switch reachable. A task that never had one shows nothing at all.
+  if (!FILE_UPLOADS_ENABLED && !loading && items.length === 0 && !error) return null;
+
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <label className="tfh-label">{FILE_UPLOADS_ENABLED ? "Attachments" : "Files uploaded earlier"}</label>
+      {loading ? (
+        <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "6px 0" }}>Loading…</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: canAttach ? 10 : 0 }}>
+          {items.map((a) => (
+            <AttachmentRow key={a.id} attachment={a} workspaceId={workspaceId} projectId={projectId} taskId={taskId} onRemove={canAttach ? () => removeAttachment(a.id) : null} />
+          ))}
+          {items.length === 0 && <div style={{ fontSize: 12, color: "var(--text-faint)" }}>No files yet.</div>}
+        </div>
+      )}
+      {canAttach && FILE_UPLOADS_ENABLED && (
+        <>
+          <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={(e) => handleFiles(e.target.files)} />
+          <button type="button" className="tfh-btn" style={{ fontSize: 12.5 }} onClick={() => fileInputRef.current?.click()} disabled={uploading}>
+            <Upload size={13} /> {uploading ? "Uploading…" : "Add photo or file"}
+          </button>
+        </>
+      )}
+      {error && <div style={{ fontSize: 12, color: "var(--pri-high)", marginTop: 8 }}>{error}</div>}
+    </div>
+  );
+};
+
+const Links = ({ workspaceId, projectId, taskId, canAttach }) => {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [label, setLabel] = useState("");
+  const [url, setUrl] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [error, setError] = useState("");
+  const [bulkMode, setBulkMode] = useState(false);
+  const [bulkText, setBulkText] = useState("");
+
+  const load = async () => {
+    try {
+      const { links } = await api.getLinks(workspaceId, projectId, taskId);
+      setItems(links);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, [taskId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!url.trim()) return;
+    setAdding(true);
+    setError("");
+    try {
+      const { link } = await api.addLink(workspaceId, projectId, taskId, label.trim(), normalizeUrl(url));
+      setItems((prev) => [...prev, link]);
+      setLabel("");
+      setUrl("");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const submitBulk = async (e) => {
+    e.preventDefault();
+    const lines = bulkText.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (lines.length === 0) return;
+    setAdding(true);
+    setError("");
+    try {
+      const created = [];
+      for (const line of lines) {
+        // "Label | https://..." or just a bare URL, label optional either way
+        const [maybeLabel, maybeUrl] = line.includes("|") ? line.split("|").map((s) => s.trim()) : [null, line];
+        const finalUrl = normalizeUrl(maybeUrl || line);
+        const finalLabel = maybeLabel || (() => { try { return new URL(finalUrl).hostname.replace(/^www\./, ""); } catch { return finalUrl; } })();
+        const { link } = await api.addLink(workspaceId, projectId, taskId, finalLabel, finalUrl);
+        created.push(link);
+      }
+      setItems((prev) => [...prev, ...created]);
+      setBulkText("");
+      setBulkMode(false);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const remove = async (id) => {
+    try {
+      await api.deleteLink(workspaceId, projectId, taskId, id);
+      setItems((prev) => prev.filter((l) => l.id !== id));
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <label className="tfh-label">File Links</label>
+        {canAttach && (
+          <button type="button" onClick={() => setBulkMode((v) => !v)} style={{ background: "none", border: "none", color: "var(--accent)", fontSize: 11, padding: 0, marginBottom: 6 }}>
+            {bulkMode ? "Add one at a time" : "Paste multiple"}
+          </button>
+        )}
+      </div>
+      {loading ? (
+        <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "6px 0" }}>Loading…</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: canAttach ? 10 : 0 }}>
+          {items.map((l) => (
+            <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 9, padding: "6px 8px", borderRadius: 8, background: "var(--raised)" }}>
+              <Link2 size={14} color="var(--text-faint)" style={{ flexShrink: 0 }} />
+              <a className="tfh-link" href={normalizeUrl(l.url)} target="_blank" rel="noopener noreferrer" style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: "var(--accent)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", textDecoration: "none" }}>
+                {l.label}
+              </a>
+              {canAttach && <button type="button" onClick={() => remove(l.id)} className="tfh-btn tfh-btn-ghost" style={{ padding: 5 }} aria-label="Remove link"><X size={13} color="var(--text-faint)" /></button>}
+            </div>
+          ))}
+          {items.length === 0 && <div style={{ fontSize: 12, color: "var(--text-faint)" }}>No links yet{canAttach ? " — paste the Google Drive link to the file below." : "."}</div>}
+        </div>
+      )}
+      {canAttach && (
+        bulkMode ? (
+          <form onSubmit={submitBulk}>
+            <textarea
+              className="tfh-input" rows={4} style={{ resize: "vertical", fontFamily: "IBM Plex Mono, monospace", fontSize: 12, marginBottom: 8 }}
+              placeholder={"Design doc | https://docs.google.com/...\nhttps://drive.google.com/... (label optional)"}
+              value={bulkText} onChange={(e) => setBulkText(e.target.value)}
+            />
+            <button className="tfh-btn tfh-btn-accent" disabled={adding || !bulkText.trim()} style={{ width: "100%" }}>
+              {adding ? "Adding…" : "Add all links"}
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={submit} style={{ display: "flex", gap: 6 }}>
+            <input className="tfh-input" placeholder="Label (optional)" value={label} onChange={(e) => setLabel(e.target.value)} style={{ flex: "0 0 40%" }} />
+            <input className="tfh-input" placeholder="https://drive.google.com/…" value={url} onChange={(e) => setUrl(e.target.value)} />
+            <button className="tfh-btn" disabled={adding || !url.trim()} style={{ flexShrink: 0 }}><Plus size={14} /></button>
+          </form>
+        )
+      )}
+      {error && <div style={{ fontSize: 12, color: "var(--pri-high)", marginTop: 8 }}>{error}</div>}
+    </div>
+  );
+};
+
+const formatCommentTime = (iso) => {
+  const d = new Date(iso);
+  const diffMin = Math.round((Date.now() - d.getTime()) / 60000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  if (diffMin < 24 * 60) return `${Math.round(diffMin / 60)}h ago`;
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+};
+
+const Comments = ({ workspaceId, projectId, taskId, canComment, currentUserId }) => {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const listRef = useRef(null);
+
+  const load = async () => {
+    try {
+      const { comments } = await api.getComments(workspaceId, projectId, taskId);
+      setItems(comments);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, [taskId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Comments used to load ONCE, on open. So if you had a task open while a
+  // colleague commented on it, you never saw their comment — the reported
+  // "member's comment doesn't appear for anyone else". The server already
+  // broadcasts every comment; this just listens for it. Scoped to this task
+  // so an unrelated comment elsewhere doesn't cause a refetch.
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket) return;
+    const onTaskChanged = (payload) => {
+      if (payload?.reason === "comment" && payload?.taskId === taskId) load();
+    };
+    socket.on("task:changed", onTaskChanged);
+    return () => socket.off("task:changed", onTaskChanged);
+  }, [taskId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => { if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }, [items.length]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!text.trim()) return;
+    setSending(true);
+    setError("");
+    try {
+      const { comment } = await api.addComment(workspaceId, projectId, taskId, text.trim());
+      setItems((prev) => [...prev, comment]);
+      setText("");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <label className="tfh-label">Comments</label>
+      {loading ? (
+        <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "6px 0" }}>Loading…</div>
+      ) : (
+        <div ref={listRef} style={{ display: "flex", flexDirection: "column", gap: 10, maxHeight: 220, overflowY: "auto", marginBottom: 10, padding: items.length ? "2px 2px" : 0 }}>
+          {items.map((c) => {
+            const mine = c.userId === currentUserId;
+            const author = { id: c.userId, name: c.userName || "Someone", color: c.userColor, initials: c.userInitials, avatarUrl: c.userAvatarUrl };
+            return (
+              <div key={c.id} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                <Avatar member={author} size={24} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>{mine ? "You" : c.userName}</span>
+                    <span style={{ fontSize: 10.5, color: "var(--text-faint)" }}>{formatCommentTime(c.createdAt)}</span>
+                  </div>
+                  <div style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.4, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{c.body}</div>
+                </div>
+              </div>
+            );
+          })}
+          {items.length === 0 && <div style={{ fontSize: 12, color: "var(--text-faint)" }}>No comments yet.</div>}
+        </div>
+      )}
+      {canComment ? (
+        <form onSubmit={submit} style={{ display: "flex", gap: 8 }}>
+          <input className="tfh-input" placeholder="Write a comment…" value={text} onChange={(e) => setText(e.target.value)} maxLength={4000} />
+          <button className="tfh-btn tfh-btn-accent" disabled={sending || !text.trim()} style={{ flexShrink: 0 }}>{sending ? "…" : "Send"}</button>
+        </form>
+      ) : (
+        <div style={{ fontSize: 11.5, color: "var(--text-faint)" }}>Only the admin, lead, or the assignee can comment here.</div>
+      )}
+      {error && <div style={{ fontSize: 12, color: "var(--pri-high)", marginTop: 8 }}>{error}</div>}
+    </div>
+  );
+};
+
+const SubtaskAttachmentsMini = ({ workspaceId, projectId, taskId, subtaskId, canManage }) => {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    api.getSubtaskAttachments(workspaceId, projectId, taskId, subtaskId)
+      .then(({ attachments }) => setItems(attachments))
+      .finally(() => setLoading(false));
+  }, [workspaceId, projectId, taskId, subtaskId]);
+
+  const handleFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setUploading(true);
+    try {
+      for (const file of files) await api.uploadSubtaskAttachment(workspaceId, projectId, taskId, subtaskId, file);
+      const { attachments } = await api.getSubtaskAttachments(workspaceId, projectId, taskId, subtaskId);
+      setItems(attachments);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const openFile = async (attachmentId, fileName, isImage) => {
+    const url = await api.getSubtaskAttachmentBlobUrl(workspaceId, projectId, taskId, subtaskId, attachmentId);
+    const a = document.createElement("a");
+    a.href = url;
+    if (isImage) a.target = "_blank"; else a.download = fileName;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+
+  const remove = async (id) => {
+    await api.deleteSubtaskAttachment(workspaceId, projectId, taskId, subtaskId, id);
+    setItems((prev) => prev.filter((a) => a.id !== id));
+  };
+
+  return (
+    <div>
+      <div className="tfh-label" style={{ fontSize: 10 }}>Files</div>
+      {loading ? <div style={{ fontSize: 11, color: "var(--text-faint)" }}>Loading…</div> : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: canManage ? 6 : 0 }}>
+          {items.map((a) => (
+            <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 7, padding: "4px 7px", borderRadius: 6, background: "var(--panel)" }}>
+              <Paperclip size={11} color="var(--text-faint)" />
+              <button type="button" onClick={() => openFile(a.id, a.fileName, a.mimeType.startsWith("image/"))} style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", fontSize: 11.5, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.fileName}</button>
+              {canManage && <button type="button" onClick={() => remove(a.id)} className="tfh-btn tfh-btn-ghost" style={{ padding: 2 }} aria-label="Remove"><X size={10} /></button>}
+            </div>
+          ))}
+          {items.length === 0 && <div style={{ fontSize: 11, color: "var(--text-faint)" }}>No files.</div>}
+        </div>
+      )}
+      {canManage && (
+        <>
+          <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={(e) => handleFiles(e.target.files)} />
+          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 10.5, padding: "3px 7px" }}>
+            <Upload size={10} /> {uploading ? "Uploading…" : "Add file"}
+          </button>
+        </>
+      )}
+    </div>
+  );
+};
+
+const SubtaskLinksMini = ({ workspaceId, projectId, taskId, subtaskId, canManage }) => {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [label, setLabel] = useState("");
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.getSubtaskLinks(workspaceId, projectId, taskId, subtaskId)
+      .then(({ links }) => setItems(links))
+      .finally(() => setLoading(false));
+  }, [workspaceId, projectId, taskId, subtaskId]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!url.trim()) return;
+    setBusy(true);
+    try {
+      const { link } = await api.addSubtaskLink(workspaceId, projectId, taskId, subtaskId, label.trim(), normalizeUrl(url));
+      setItems((prev) => [...prev, link]);
+      setLabel(""); setUrl("");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (id) => {
+    await api.deleteSubtaskLink(workspaceId, projectId, taskId, subtaskId, id);
+    setItems((prev) => prev.filter((l) => l.id !== id));
+  };
+
+  return (
+    <div>
+      <div className="tfh-label" style={{ fontSize: 10 }}>Links</div>
+      {loading ? <div style={{ fontSize: 11, color: "var(--text-faint)" }}>Loading…</div> : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: canManage ? 6 : 0 }}>
+          {items.map((l) => (
+            <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 7, padding: "4px 7px", borderRadius: 6, background: "var(--panel)" }}>
+              <Link2 size={11} color="var(--text-faint)" />
+              <a className="tfh-link" href={normalizeUrl(l.url)} target="_blank" rel="noopener noreferrer" style={{ flex: 1, minWidth: 0, fontSize: 11.5, color: "var(--accent)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", textDecoration: "none" }}>{l.label}</a>
+              {canManage && <button type="button" onClick={() => remove(l.id)} className="tfh-btn tfh-btn-ghost" style={{ padding: 2 }} aria-label="Remove"><X size={10} /></button>}
+            </div>
+          ))}
+          {items.length === 0 && <div style={{ fontSize: 11, color: "var(--text-faint)" }}>No links.</div>}
+        </div>
+      )}
+      {canManage && (
+        <form onSubmit={submit} style={{ display: "flex", gap: 5 }}>
+          <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Label" className="tfh-input" style={{ fontSize: 11, flex: "0 0 36%" }} />
+          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://…" className="tfh-input" style={{ fontSize: 11 }} />
+          <button className="tfh-btn tfh-btn-ghost" disabled={busy || !url.trim()} style={{ padding: "3px 7px", flexShrink: 0 }}><Plus size={11} /></button>
+        </form>
+      )}
+    </div>
+  );
+};
+
+const NewSubtaskForm = ({ onAdd, onCancel }) => {
+  const [text, setText] = useState("");
+  const [description, setDescription] = useState("");
+  const [startTime, setStartTime] = useState("");
+  const [endTime, setEndTime] = useState("");
+  const [links, setLinks] = useState([]);
+  const [linkLabel, setLinkLabel] = useState("");
+  const [linkUrl, setLinkUrl] = useState("");
+  const [files, setFiles] = useState([]);
+  const [fileError, setFileError] = useState("");
+  const fileInputRef = useRef(null);
+  const titleRef = useRef(null);
+  useEffect(() => { titleRef.current?.focus(); }, []);
+
+  const addLink = (e) => {
+    e.preventDefault();
+    if (!linkUrl.trim()) return;
+    setLinks((prev) => [...prev, { label: linkLabel.trim() || linkUrl.trim(), url: normalizeUrl(linkUrl) }]);
+    setLinkLabel(""); setLinkUrl("");
+  };
+  const removeLink = (i) => setLinks((prev) => prev.filter((_, idx) => idx !== i));
+
+  const handleFiles = (fileList) => {
+    const { accepted, rejected } = validateFiles(fileList);
+    if (accepted.length) setFiles((prev) => [...prev, ...accepted]);
+    if (rejected.length) setFileError(`${rejected.join(", ")} — over the ${MAX_FILE_MB}MB limit, not added.`);
+    else setFileError("");
+  };
+  const removeFile = (i) => setFiles((prev) => prev.filter((_, idx) => idx !== i));
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!text.trim()) return;
+    onAdd({ text: text.trim(), description, startTime, endTime, pendingLinks: links, pendingFiles: files });
+  };
+
+  return (
+    <form onSubmit={submit} className="tfh-card" style={{ padding: 14, background: "var(--raised)", borderColor: "var(--accent)" }}>
+      <label className="tfh-label" style={{ fontSize: 10 }}>Subtask title</label>
+      <input ref={titleRef} className="tfh-input" placeholder="What's this mini task?" value={text} onChange={(e) => setText(e.target.value)} style={{ marginBottom: 10, fontSize: 13 }} />
+
+      <label className="tfh-label" style={{ fontSize: 10 }}>Description</label>
+      <textarea className="tfh-input" rows={2} placeholder="Details for this item (optional)" value={description} onChange={(e) => setDescription(e.target.value)} style={{ marginBottom: 10, resize: "vertical", fontSize: 12.5 }} />
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+        <div>
+          <label className="tfh-label" style={{ fontSize: 10 }}>Start time</label>
+          <input type="time" className="tfh-input" value={startTime} onChange={(e) => setStartTime(e.target.value)} style={{ fontSize: 12 }} />
+        </div>
+        <div>
+          <label className="tfh-label" style={{ fontSize: 10 }}>End time</label>
+          <input type="time" className="tfh-input" value={endTime} onChange={(e) => setEndTime(e.target.value)} style={{ fontSize: 12 }} />
+        </div>
+      </div>
+
+      <label className="tfh-label" style={{ fontSize: 10 }}>Links</label>
+      {links.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 6 }}>
+          {links.map((l, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 7, padding: "4px 7px", borderRadius: 6, background: "var(--panel)" }}>
+              <Link2 size={11} color="var(--text-faint)" />
+              <a className="tfh-link" href={normalizeUrl(l.url)} target="_blank" rel="noopener noreferrer" style={{ flex: 1, fontSize: 11.5, color: "var(--accent)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: "none" }} title={l.url}>{l.label}</a>
+              <button type="button" onClick={() => removeLink(i)} className="tfh-btn tfh-btn-ghost" style={{ padding: 2 }} aria-label="Remove link"><X size={10} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 5, marginBottom: 12 }}>
+        <input value={linkLabel} onChange={(e) => setLinkLabel(e.target.value)} placeholder="Label" className="tfh-input" style={{ fontSize: 11, flex: "0 0 36%" }} />
+        <input value={linkUrl} onChange={(e) => setLinkUrl(e.target.value)} placeholder="https://…" className="tfh-input" style={{ fontSize: 11 }} />
+        <button type="button" onClick={addLink} className="tfh-btn tfh-btn-ghost" style={{ padding: "3px 7px", flexShrink: 0 }} aria-label="Add link"><Plus size={11} /></button>
+      </div>
+
+      <label className="tfh-label" style={{ fontSize: 10 }}>Files</label>
+      {files.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 6 }}>
+          {files.map((f, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 7, padding: "4px 7px", borderRadius: 6, background: "var(--panel)" }}>
+              <Paperclip size={11} color="var(--text-faint)" />
+              <span style={{ flex: 1, fontSize: 11.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span>
+              <button type="button" onClick={() => removeFile(i)} className="tfh-btn tfh-btn-ghost" style={{ padding: 2 }} aria-label="Remove file"><X size={10} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+      <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }} />
+      <button type="button" onClick={() => fileInputRef.current?.click()} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 10.5, padding: "3px 7px", marginBottom: fileError ? 6 : 14 }}>
+        <Upload size={10} /> Add file
+      </button>
+      {fileError && <div style={{ fontSize: 10.5, color: "var(--pri-high)", marginBottom: 14 }}>{fileError}</div>}
+
+      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", borderTop: "1px solid var(--line)", paddingTop: 12 }}>
+        <button type="button" className="tfh-btn" onClick={onCancel}>Cancel</button>
+        <button className="tfh-btn tfh-btn-accent" disabled={!text.trim()}><Plus size={13} /> Add subtask</button>
+      </div>
+    </form>
+  );
+};
+
+const SubtaskRow = ({ subtask, canManage, canAttach, workspaceId, projectId, taskId, onToggle, onRemove, onUpdate }) => {
+  const [expanded, setExpanded] = useState(false);
+  const isSaved = subtask.id && !String(subtask.id).startsWith("local-");
+  const hasTime = subtask.startTime || subtask.endTime;
+  const pendingLinks = subtask.pendingLinks || [];
+  const pendingFiles = subtask.pendingFiles || [];
+  const hasExtras = (subtask.attachmentCount > 0) || (subtask.linkCount > 0) || subtask.description || pendingFiles.length > 0 || pendingLinks.length > 0;
+
+  return (
+    <div className="tfh-card" style={{ padding: "8px 10px", background: "var(--raised)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <MiniCheckbox checked={subtask.done} onClick={canManage ? () => onToggle(subtask.id) : undefined} disabled={!canManage} />
+        <span style={{ flex: 1, minWidth: 0, fontSize: 13, textDecoration: subtask.done ? "line-through" : "none", color: subtask.done ? "var(--text-faint)" : "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{subtask.text}</span>
+        {hasTime && (
+          <span className="tfh-chip tfh-mono" style={{ background: "var(--accent-soft)", color: "var(--accent)", flexShrink: 0 }}>
+            <Clock size={9} /> {subtask.startTime ? formatTimeLabel(subtask.startTime) : ""}{subtask.endTime ? ` – ${formatTimeLabel(subtask.endTime)}` : ""}
+          </span>
+        )}
+        {subtask.attachmentCount > 0 && <span className="tfh-chip" style={{ flexShrink: 0 }}><Paperclip size={9} /> {subtask.attachmentCount}</span>}
+        {subtask.linkCount > 0 && <span className="tfh-chip" style={{ flexShrink: 0 }}><Link2 size={9} /> {subtask.linkCount}</span>}
+        {!isSaved && pendingFiles.length > 0 && <span className="tfh-chip" style={{ flexShrink: 0, background: "var(--accent-soft)", color: "var(--accent)" }}><Paperclip size={9} /> {pendingFiles.length} pending</span>}
+        {!isSaved && pendingLinks.length > 0 && <span className="tfh-chip" style={{ flexShrink: 0, background: "var(--accent-soft)", color: "var(--accent)" }}><Link2 size={9} /> {pendingLinks.length} pending</span>}
+        <button type="button" onClick={() => setExpanded((v) => !v)} className="tfh-btn tfh-btn-ghost" style={{ padding: 3, flexShrink: 0 }} aria-label="Expand">
+          {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+        </button>
+        {canManage && <button type="button" onClick={() => onRemove(subtask.id)} className="tfh-btn tfh-btn-ghost" style={{ padding: 3, flexShrink: 0 }} aria-label="Remove subtask"><X size={13} color="var(--text-faint)" /></button>}
+      </div>
+
+      {expanded && (
+        <div className="tfh-expand-in" style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--line)", display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <div>
+              <label className="tfh-label" style={{ fontSize: 10 }}>Start time</label>
+              <input type="time" disabled={!canManage} value={subtask.startTime || ""} onChange={(e) => onUpdate(subtask.id, { startTime: e.target.value })} className="tfh-input" style={{ fontSize: 12 }} />
+            </div>
+            <div>
+              <label className="tfh-label" style={{ fontSize: 10 }}>End time</label>
+              <input type="time" disabled={!canManage} value={subtask.endTime || ""} onChange={(e) => onUpdate(subtask.id, { endTime: e.target.value })} className="tfh-input" style={{ fontSize: 12 }} />
+            </div>
+          </div>
+          <div>
+            <label className="tfh-label" style={{ fontSize: 10 }}>Description</label>
+            <textarea disabled={!canManage} placeholder="Details for this item" value={subtask.description || ""} onChange={(e) => onUpdate(subtask.id, { description: e.target.value })} className="tfh-input" rows={2} style={{ fontSize: 12, resize: "vertical" }} />
+          </div>
+          {isSaved ? (
+            <>
+              <SubtaskAttachmentsMini workspaceId={workspaceId} projectId={projectId} taskId={taskId} subtaskId={subtask.id} canManage={canAttach} />
+              <SubtaskLinksMini workspaceId={workspaceId} projectId={projectId} taskId={taskId} subtaskId={subtask.id} canManage={canAttach} />
+            </>
+          ) : (
+            <>
+              {(pendingFiles.length > 0 || pendingLinks.length > 0) ? (
+                <>
+                  {pendingFiles.length > 0 && (
+                    <div>
+                      <div className="tfh-label" style={{ fontSize: 10 }}>Files (will upload on save)</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        {pendingFiles.map((f, i) => (
+                          <div key={i} style={{ display: "flex", alignItems: "center", gap: 7, padding: "4px 7px", borderRadius: 6, background: "var(--panel)" }}>
+                            <Paperclip size={11} color="var(--text-faint)" />
+                            <span style={{ flex: 1, fontSize: 11.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{f.name}</span>
+                            {canManage && <button type="button" onClick={() => onUpdate(subtask.id, { pendingFiles: pendingFiles.filter((_, idx) => idx !== i) })} className="tfh-btn tfh-btn-ghost" style={{ padding: 2 }} aria-label="Remove"><X size={10} /></button>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {pendingLinks.length > 0 && (
+                    <div>
+                      <div className="tfh-label" style={{ fontSize: 10 }}>Links (will save with the subtask)</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        {pendingLinks.map((l, i) => (
+                          <div key={i} style={{ display: "flex", alignItems: "center", gap: 7, padding: "4px 7px", borderRadius: 6, background: "var(--panel)" }}>
+                            <Link2 size={11} color="var(--text-faint)" />
+                            <span style={{ flex: 1, fontSize: 11.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{l.label}</span>
+                            {canManage && <button type="button" onClick={() => onUpdate(subtask.id, { pendingLinks: pendingLinks.filter((_, idx) => idx !== i) })} className="tfh-btn tfh-btn-ghost" style={{ padding: 2 }} aria-label="Remove"><X size={10} /></button>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div style={{ fontSize: 11, color: "var(--text-faint)" }}>No files or links queued for this item yet.</div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+      {!expanded && hasExtras && (
+        <button type="button" onClick={() => setExpanded(true)} style={{ background: "none", border: "none", padding: 0, marginTop: 4, fontSize: 10.5, color: "var(--text-faint)" }}>
+          {subtask.description ? "Has a description" : "Has details"} — click to view
+        </button>
+      )}
+    </div>
+  );
+};
+
+// Staging area for a brand-new task's own files/links, shown only while
+// creating it (no task id exists yet to attach to directly). Mirrors the
+// same stage-then-upload pattern already used for subtasks and milestones —
+// uploaded automatically once the task is saved and has a real id.
+const PendingFilesLinks = ({ draft, setDraft }) => {
+  const [linkLabel, setLinkLabel] = useState("");
+  const [linkUrl, setLinkUrl] = useState("");
+  const [fileError, setFileError] = useState("");
+  const fileInputRef = useRef(null);
+
+  const addLink = (e) => {
+    e.preventDefault();
+    if (!linkUrl.trim()) return;
+    setDraft({ ...draft, pendingLinks: [...draft.pendingLinks, { label: linkLabel.trim() || linkUrl.trim(), url: normalizeUrl(linkUrl) }] });
+    setLinkLabel(""); setLinkUrl("");
+  };
+  const removeLink = (i) => setDraft({ ...draft, pendingLinks: draft.pendingLinks.filter((_, idx) => idx !== i) });
+  const handleFiles = (fileList) => {
+    const { accepted, rejected } = validateFiles(fileList);
+    if (accepted.length) setDraft({ ...draft, pendingFiles: [...draft.pendingFiles, ...accepted] });
+    if (rejected.length) setFileError(`${rejected.join(", ")} — over the ${MAX_FILE_MB}MB limit, not added.`);
+    else setFileError("");
+  };
+  const removeFile = (i) => setDraft({ ...draft, pendingFiles: draft.pendingFiles.filter((_, idx) => idx !== i) });
+
+  return (
+    <div className="tfh-card" style={{ padding: 16, marginBottom: 18 }}>
+      {FILE_UPLOADS_ENABLED && (<>
+      <label className="tfh-label">Files</label>
+      {draft.pendingFiles.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 6 }}>
+          {draft.pendingFiles.map((f, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 8px", borderRadius: 7, background: "var(--raised)" }}>
+              <Paperclip size={12} color="var(--text-faint)" />
+              <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span>
+              <button type="button" onClick={() => removeFile(i)} className="tfh-btn tfh-btn-ghost" style={{ padding: 3 }} aria-label="Remove file"><X size={11} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+      <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }} />
+      <button type="button" onClick={() => fileInputRef.current?.click()} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11.5, padding: "4px 9px", marginBottom: 16 }}>
+        <Upload size={11} /> Add file
+      </button>
+      {fileError && <div style={{ fontSize: 11, color: "var(--pri-high)", marginBottom: 14 }}>{fileError}</div>}
+      </>)}
+
+      <label className="tfh-label">File Links</label>
+      <div style={{ fontSize: 11.5, color: "var(--text-faint)", margin: "-2px 0 8px", lineHeight: 1.45 }}>
+        Paste the Google Drive link to the file or folder — everyone opens the same copy.
+      </div>
+      {draft.pendingLinks.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 6 }}>
+          {draft.pendingLinks.map((l, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 8px", borderRadius: 7, background: "var(--raised)" }}>
+              <Link2 size={12} color="var(--text-faint)" />
+              <a className="tfh-link" href={normalizeUrl(l.url)} target="_blank" rel="noopener noreferrer" style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--accent)", textDecoration: "none" }} title={l.url}>{l.label}</a>
+              <button type="button" onClick={() => removeLink(i)} className="tfh-btn tfh-btn-ghost" style={{ padding: 3 }} aria-label="Remove link"><X size={11} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 6 }}>
+        <input value={linkLabel} onChange={(e) => setLinkLabel(e.target.value)} placeholder="Label" className="tfh-input" style={{ fontSize: 12, flex: "0 0 36%" }} />
+        <input
+          value={linkUrl} onChange={(e) => setLinkUrl(e.target.value)} placeholder="https://drive.google.com/…" className="tfh-input" style={{ fontSize: 12 }}
+          // Enter adds the link rather than submitting the whole dialog.
+          onKeyDown={(e) => { if (e.key === "Enter") addLink(e); }}
+        />
+        <button type="button" onClick={addLink} className="tfh-btn tfh-btn-ghost" style={{ padding: "4px 9px", flexShrink: 0 }} aria-label="Add link"><Plus size={12} /></button>
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Reminders — set like Google Calendar's event notifications            */
+/* ------------------------------------------------------------------ */
+// Each row reads like Google's: [Notification ▾] [10] [minutes ▾] before.
+// Stored on the server as minutesBefore + method; the amount/unit split is
+// only how a person types it.
+const REMINDER_UNITS = [
+  { id: "minutes", label: "minutes", minutes: 1 },
+  { id: "hours", label: "hours", minutes: 60 },
+  { id: "days", label: "days", minutes: 1440 },
+  { id: "weeks", label: "weeks", minutes: 10080 },
+];
+const MAX_REMINDERS = 5;
+const MAX_REMINDER_MINUTES = 4 * 10080;
+// Office time is Bhutan (UTC+6, no daylight saving) — the same zone the
+// server fires reminders in, so the preview shows what will really happen.
+const OFFICE_UTC_OFFSET_MIN = 6 * 60;
+const ALL_DAY_REMINDER_TIME = "09:00";
+
+// minutesBefore → the largest whole unit, as a person would say it.
+const reminderToRow = (r, i) => {
+  const unit = [...REMINDER_UNITS].reverse().find((u) => r.minutesBefore % u.minutes === 0 && r.minutesBefore >= u.minutes) || REMINDER_UNITS[0];
+  return { key: r.id || `r${i}-${r.minutesBefore}-${r.method}`, method: r.method || "notification", amount: String(r.minutesBefore / unit.minutes), unit: unit.id };
+};
+const rowToMinutes = (row) => {
+  const unit = REMINDER_UNITS.find((u) => u.id === row.unit) || REMINDER_UNITS[0];
+  const n = Number(row.amount);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n * unit.minutes) : NaN;
+};
+// What the server receives. Rows that are blank or out of range are left out
+// and flagged in the editor rather than silently saved as something else.
+const rowsToReminders = (rows) =>
+  (rows || [])
+    .map((row) => ({ minutesBefore: rowToMinutes(row), method: row.method }))
+    .filter((r) => Number.isInteger(r.minutesBefore) && r.minutesBefore >= 0 && r.minutesBefore <= MAX_REMINDER_MINUTES);
+const remindersKey = (list) => JSON.stringify((list || []).map((r) => `${r.minutesBefore}:${r.method}`).sort());
+
+// When a reminder will go off, in office time: "Thu 22 Oct, 9:50 AM".
+const reminderFiresAt = (due, dueTime, minutesBefore) => {
+  if (!due || !Number.isFinite(minutesBefore)) return null;
+  const [y, m, d] = due.split("-").map(Number);
+  const [hh, mm] = (dueTime || ALL_DAY_REMINDER_TIME).split(":").map(Number);
+  // Arithmetic on "office wall-clock as if UTC", then read the fields back.
+  const at = new Date(Date.UTC(y, m - 1, d, hh, mm) - minutesBefore * 60000);
+  const iso = `${at.getUTCFullYear()}-${String(at.getUTCMonth() + 1).padStart(2, "0")}-${String(at.getUTCDate()).padStart(2, "0")}`;
+  const clockStr = `${String(at.getUTCHours()).padStart(2, "0")}:${String(at.getUTCMinutes()).padStart(2, "0")}`;
+  const nowOffice = Date.now() + OFFICE_UTC_OFFSET_MIN * 60000;
+  return { label: `${dayAndDate(iso)}, ${formatTimeLabel(clockStr)}`, past: at.getTime() <= nowOffice };
+};
+
+const RemindersField = ({ draft, setDraft, disabled }) => {
+  const rows = draft.reminderRows;
+  const loading = Boolean(draft.id) && rows === null;
+  const hasDue = Boolean(draft.due);
+  const inSeries = Boolean(draft.id) && Boolean(draft.recurrence || draft.recurrenceParentId);
+  const changed = Boolean(draft.id) && rows && remindersKey(rowsToReminders(rows)) !== remindersKey(draft.originalReminders || []);
+  const [permission, setPermission] = useState(typeof Notification !== "undefined" ? Notification.permission : "unsupported");
+
+  const setRows = (next) => setDraft({ ...draft, reminderRows: next });
+  const update = (key, patch) => setRows(rows.map((r) => (r.key === key ? { ...r, ...patch } : r)));
+  const add = () => {
+    // Google's defaults: 30 minutes before a timed event, the day before an
+    // all-day one. Skip any already in the list so "Add" always adds.
+    const taken = new Set(rowsToReminders(rows).map((r) => `${r.minutesBefore}:${r.method}`));
+    const candidates = draft.dueTime ? [30, 10, 60, 1440, 0, 120] : [1440, 0, 2880, 10080];
+    const minutes = candidates.find((m) => !taken.has(`${m}:notification`)) ?? 15;
+    const row = reminderToRow({ minutesBefore: minutes, method: "notification" }, Date.now());
+    setRows([...(rows || []), { ...row, key: `new-${Date.now()}` }]);
+  };
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <label className="tfh-label" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <Bell size={11} /> Reminders
+        <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(optional — sent to the assignees)</span>
+      </label>
+
+      {!hasDue ? (
+        <div style={{ fontSize: 12, color: "var(--text-faint)" }}>Set a due date to add reminders.</div>
+      ) : loading ? (
+        <div style={{ fontSize: 12, color: "var(--text-faint)" }}>Loading reminders…</div>
+      ) : (
+        <>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {(rows || []).map((row) => {
+              const minutes = rowToMinutes(row);
+              const invalid = !Number.isInteger(minutes) || minutes < 0 || minutes > MAX_REMINDER_MINUTES;
+              const fires = invalid ? null : reminderFiresAt(draft.due, draft.dueTime, minutes);
+              return (
+                <div key={row.key} className="tfh-reminder-row">
+                  <select
+                    className="tfh-input" disabled={disabled} value={row.method}
+                    onChange={(e) => update(row.key, { method: e.target.value })}
+                    aria-label="How to remind" style={{ width: 136, fontSize: 12.5 }}
+                  >
+                    <option value="notification">Notification</option>
+                    <option value="email">Email</option>
+                  </select>
+                  <input
+                    className="tfh-input" type="number" min="0" step="1" disabled={disabled}
+                    value={row.amount} onChange={(e) => update(row.key, { amount: e.target.value })}
+                    aria-label="How long before" style={{ width: 70, fontSize: 12.5, borderColor: invalid ? "var(--pri-high)" : undefined }}
+                  />
+                  <select
+                    className="tfh-input" disabled={disabled} value={row.unit}
+                    onChange={(e) => update(row.key, { unit: e.target.value })}
+                    aria-label="Unit" style={{ width: 104, fontSize: 12.5 }}
+                  >
+                    {REMINDER_UNITS.map((u) => <option key={u.id} value={u.id}>{u.label}</option>)}
+                  </select>
+                  <span style={{ fontSize: 12, color: "var(--text-dim)" }}>before</span>
+                  <span
+                    className="tfh-reminder-when"
+                    style={{ color: invalid ? "var(--pri-high)" : fires?.past ? "var(--text-faint)" : "var(--text-dim)" }}
+                  >
+                    {invalid
+                      ? "0 minutes to 4 weeks"
+                      : fires && (fires.past ? `${fires.label} · already passed` : `→ ${fires.label}`)}
+                  </span>
+                  {!disabled && (
+                    <button
+                      type="button" className="tfh-btn tfh-btn-ghost" style={{ padding: 4, marginLeft: "auto" }}
+                      onClick={() => setRows(rows.filter((r) => r.key !== row.key))} aria-label="Remove reminder" title="Remove"
+                    >
+                      <X size={13} color="var(--text-faint)" />
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {!disabled && (rows || []).length < MAX_REMINDERS && (
+            <button type="button" className="tfh-btn tfh-btn-ghost" onClick={add} style={{ fontSize: 12, padding: "4px 8px", marginTop: 6 }}>
+              <Plus size={12} /> Add reminder
+            </button>
+          )}
+
+          {(rows || []).length > 0 && !draft.dueTime && (
+            <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 6 }}>
+              No start time set, so reminders count back from 9:00 AM on the due date.
+            </div>
+          )}
+
+          {inSeries && changed && !disabled && (
+            <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12, color: "var(--text-dim)", marginTop: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox" checked={!!draft.remindersForSeries}
+                onChange={(e) => setDraft({ ...draft, remindersForSeries: e.target.checked })}
+              />
+              Apply to all upcoming repeats of this activity
+            </label>
+          )}
+
+          {/* Desktop pop-ups are what make a reminder noticeable while you're
+              in another window — offer them where they matter. */}
+          {(rows || []).some((r) => r.method === "notification") && permission === "default" && (
+            <button
+              type="button"
+              onClick={async () => setPermission(await Notification.requestPermission())}
+              style={{ display: "block", background: "none", border: "none", padding: 0, marginTop: 8, fontSize: 11.5, color: "var(--accent)", cursor: "pointer" }}
+            >
+              Allow desktop pop-ups, so reminders show even when {BRAND.appName} is in the background
+            </button>
+          )}
+          {(rows || []).some((r) => r.method === "notification") && permission === "denied" && (
+            <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 8 }}>
+              Desktop pop-ups are blocked in this browser, so reminders will appear in the bell only. Allow notifications for this site in the browser's settings to get pop-ups.
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Recurring activities — the "does this repeat?" control               */
+/* ------------------------------------------------------------------ */
+// Mirrors the rule shape the backend stores and validates (see
+// backend/src/utils/recurrence.js): { freq, interval, byWeekday, until }.
+// "Every weekday" is deliberately not its own freq — it's weekly on
+// Mon–Fri, so the data model stays at three frequencies.
+const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const WEEKDAYS_ONLY = [1, 2, 3, 4, 5];
+
+const REPEAT_PRESETS = [
+  { id: "none", label: "Does not repeat" },
+  { id: "daily", label: "Daily" },
+  { id: "weekdays", label: "Every weekday (Mon–Fri)" },
+  { id: "weekly", label: "Weekly on…" },
+  { id: "monthly", label: "Monthly on this date" },
+];
+
+const sameDays = (a = [], b = []) => a.length === b.length && a.every((d, i) => d === b[i]);
+
+// Which preset a stored rule corresponds to — so reopening a task shows the
+// control in the state the user left it, not reset to "Does not repeat".
+const presetOf = (rule) => {
+  if (!rule) return "none";
+  if (rule.freq === "daily") return "daily";
+  if (rule.freq === "monthly") return "monthly";
+  if (rule.freq === "weekly" && rule.interval === 1 && sameDays(rule.byWeekday, WEEKDAYS_ONLY)) return "weekdays";
+  return "weekly";
+};
+
+const describeRecurrence = (rule) => {
+  if (!rule) return "";
+  const every = rule.interval > 1 ? `every ${rule.interval} ` : "every ";
+  let base;
+  if (rule.freq === "daily") base = rule.interval > 1 ? `Repeats every ${rule.interval} days` : "Repeats daily";
+  else if (rule.freq === "monthly") base = rule.interval > 1 ? `Repeats ${every}months on this date` : "Repeats monthly on this date";
+  else if (sameDays(rule.byWeekday, WEEKDAYS_ONLY) && rule.interval === 1) base = "Repeats every weekday";
+  else base = `Repeats ${every}week${rule.interval > 1 ? "s" : ""} on ${(rule.byWeekday || []).map((d) => WEEKDAY_LABELS[d]).join(", ")}`;
+  return rule.until ? `${base}, until ${shortDate(rule.until)}` : base;
+};
+
+const RecurrenceField = ({ value, due, disabled, isOccurrence, stopRequested, onChange, onStopSeries }) => {
+  const preset = presetOf(value);
+  const dueWeekday = due ? new Date(`${due}T12:00:00`).getDay() : new Date().getDay();
+
+  // An occurrence generated from a series can't own the rule — editing the
+  // schedule happens on the first activity, which is also where the backend
+  // enforces it. Show the rule read-only rather than a control that would
+  // be rejected on save.
+  if (isOccurrence) {
+    return (
+      <div style={{ background: "var(--raised)", padding: "11px 12px", borderRadius: 10, marginBottom: 14, display: "flex", flexDirection: "column", gap: 9 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--text-dim)" }}>
+          <Repeat size={13} color="var(--accent)" style={{ flexShrink: 0 }} />
+          <span>Part of a repeating activity. Deleting this one removes just this date — it won't come back.</span>
+        </div>
+        {/* You can stop the whole series from any occurrence now. Requiring
+            people to find "the first one" was the practical reason a daily
+            activity couldn't be switched off. */}
+        {!disabled && (
+          stopRequested ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11.5, color: "var(--pri-high)", fontWeight: 600 }}>
+              <Check size={13} /> Will stop repeating when you save
+              <button type="button" onClick={() => onStopSeries(false)} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11, padding: "2px 8px" }}>Undo</button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onStopSeries(true)}
+              className="tfh-btn tfh-btn-danger"
+              style={{ fontSize: 11.5, padding: "4px 10px", alignSelf: "flex-start" }}
+              title="Stops all future occurrences of this activity"
+            >
+              <X size={12} /> Stop repeating
+            </button>
+          )
+        )}
+      </div>
+    );
+  }
+
+  const applyPreset = (id) => {
+    if (id === "none") return onChange(null);
+    const until = value?.until || null;
+    if (id === "daily") return onChange({ freq: "daily", interval: 1, byWeekday: null, until });
+    if (id === "monthly") return onChange({ freq: "monthly", interval: 1, byWeekday: null, until });
+    if (id === "weekdays") return onChange({ freq: "weekly", interval: 1, byWeekday: WEEKDAYS_ONLY, until });
+    return onChange({ freq: "weekly", interval: value?.interval || 1, byWeekday: value?.byWeekday?.length ? value.byWeekday : [dueWeekday], until });
+  };
+
+  const toggleWeekday = (day) => {
+    const current = value?.byWeekday || [];
+    const next = current.includes(day) ? current.filter((d) => d !== day) : [...current, day].sort((a, b) => a - b);
+    if (next.length === 0) return; // a weekly rule with no day would never fire
+    onChange({ ...value, byWeekday: next });
+  };
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <label className="tfh-label" htmlFor="tfh-repeat">
+        Repeat <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(for activities that happen on a schedule)</span>
+      </label>
+      <select
+        id="tfh-repeat" className="tfh-input" disabled={disabled} value={preset}
+        onChange={(e) => applyPreset(e.target.value)}
+        style={{ opacity: disabled ? 0.7 : 1 }}
+      >
+        {REPEAT_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+      </select>
+
+      {value && (
+        <div className="tfh-expand-in" style={{ marginTop: 10, padding: 12, borderRadius: 10, background: "var(--raised)", display: "flex", flexDirection: "column", gap: 10 }}>
+          {preset === "weekly" && (
+            <div>
+              <div style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 6 }}>On these days</div>
+              <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                {WEEKDAY_LABELS.map((label, day) => {
+                  const on = (value.byWeekday || []).includes(day);
+                  return (
+                    <button
+                      key={day} type="button" disabled={disabled} onClick={() => toggleWeekday(day)}
+                      className="tfh-btn"
+                      style={{ fontSize: 11, padding: "4px 9px", background: on ? "var(--accent-soft)" : "transparent", color: on ? "var(--accent)" : "var(--text-dim)", borderColor: on ? "var(--accent)" : "var(--line)" }}
+                      aria-pressed={on}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            {preset !== "weekdays" && (
+              <div>
+                <div style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 4 }}>
+                  Every {value.freq === "daily" ? "n days" : value.freq === "weekly" ? "n weeks" : "n months"}
+                </div>
+                <input
+                  type="number" min={1} max={52} className="tfh-input" disabled={disabled}
+                  value={value.interval || 1}
+                  onChange={(e) => onChange({ ...value, interval: Math.min(52, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
+                  style={{ fontSize: 12 }}
+                />
+              </div>
+            )}
+            <div>
+              <div style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 4 }}>Ends on (optional)</div>
+              <DateField
+                disabled={disabled} min={due || undefined}
+                value={value.until || ""}
+                onChange={(v) => onChange({ ...value, until: v || null })}
+                ariaLabel="Repeat end date"
+              />
+            </div>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--accent)" }}>
+            <Repeat size={12} /> {describeRecurrence(value)}
+            {!due && <span style={{ color: "var(--pri-high)" }}>— pick a due date first</span>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const TaskDialog = ({ draft, setDraft, users, projects, onClose, onSave, onDelete, saving, saveError, uploadPhase, isWorkspaceManager, workspaceId, currentUserId }) => {
+  const [addingSubtask, setAddingSubtask] = useState(false);
+  const titleRef = useRef(null);
+  useEffect(() => { titleRef.current?.focus(); }, []);
+
+  // canManage has to be computed per-task now, not passed in pre-decided —
+  // Board shows tasks from every project at once, so "am I this project's
+  // lead" has to check THIS task's own project (draft.projectId), not
+  // whichever project happens to be selected in the sidebar.
+  const taskProject = projects.find((p) => p.id === draft.projectId);
+  const canManage = isWorkspaceManager || taskProject?.leadId === currentUserId;
+
+  // Anyone can fill in every field while CREATING a brand-new task. Once a
+  // task exists: a manager can edit/attach on any task; a plain member can
+  // now fully edit and attach on a task assigned to THEM specifically — but
+  // reassigning it to someone else stays manager-only even then (see
+  // canChangeAssignee below), and a task NOT assigned to you stays view +
+  // comment only, matching what was asked to stay unchanged.
+  // "Mine" now means assigned to me OR created by me. A member can edit and
+  // delete either; work that is neither — between two other people — stays
+  // view + comment only, so nobody can quietly delete someone else's record.
+  const isOwnTask = Boolean(draft.id) && (isAssignedTo(draft, currentUserId) || draft.createdBy === currentUserId);
+  const canEditFields = !draft.id || canManage || isOwnTask;
+  const canAttach = canManage || isOwnTask;
+  const canChangeAssignee = !draft.id || canManage;
+  // Deleting is narrower than editing: an assignee can work on a task someone
+  // gave them but not delete it — only the person who assigned it can (plus
+  // the admin, team leads and this project's lead). Same rule as the server's
+  // canDeleteTask.
+  const canDelete = Boolean(draft.id) && (canManage || (Boolean(draft.createdBy) && draft.createdBy === currentUserId));
+  const deleteBlockedReason = Boolean(draft.id) && !canDelete && isAssignedTo(draft, currentUserId)
+    ? `Only ${draft.createdByName || "the person who assigned this"}, or the admin or a lead, can delete it.`
+    : "";
+
+  const addSubtask = (fields) => {
+    setDraft({ ...draft, subtasks: [...draft.subtasks, { id: `local-${Date.now()}`, done: false, attachmentCount: 0, linkCount: 0, ...fields }] });
+    setAddingSubtask(false);
+  };
+  const toggleSubtask = (id) => setDraft({ ...draft, subtasks: draft.subtasks.map((s) => (s.id === id ? { ...s, done: !s.done } : s)) });
+  const removeSubtask = (id) => setDraft({ ...draft, subtasks: draft.subtasks.filter((s) => s.id !== id) });
+  const updateSubtask = (id, patch) => setDraft({ ...draft, subtasks: draft.subtasks.map((s) => (s.id === id ? { ...s, ...patch } : s)) });
+
+  return (
+    <div className="tfh-modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="tfh-card tfh-modal-card" style={{ width: "100%", maxWidth: 560, maxHeight: "88vh", overflowY: "auto", padding: 22 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <span className="tfh-display" style={{ fontSize: 19, fontWeight: 600 }}>{draft.id ? "Edit task" : "New task"}</span>
+          <button className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+
+        {/* Who gave you this piece of work. First thing in the dialog,
+            because "who asked me to do this?" is the question people open a
+            task to answer. Absent when you created it yourself. */}
+        {draft.id && draft.createdByName && draft.createdBy !== draft.assigneeId && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: "var(--text)", background: "var(--accent-soft)", padding: "9px 12px", borderRadius: 10, marginBottom: 14 }}>
+            <UserPlus size={13} color="var(--accent)" />
+            <span>Assigned by <strong>{draft.createdByName}</strong></span>
+          </div>
+        )}
+
+        {/* The lock notice follows what you can actually DO, not your role —
+            a member editing their own task used to be told it was view-only
+            while every field was editable. */}
+        {!canEditFields && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--text-dim)", background: "var(--raised)", padding: "9px 12px", borderRadius: 10, marginBottom: 14 }}>
+            <Lock size={13} /> View only — you can comment below. This task is neither assigned to you nor created by you, so only its owner, your admin, team lead, or this project's lead can change it.
+          </div>
+        )}
+
+        <label className="tfh-label" htmlFor="tfh-title">Title</label>
+        <input id="tfh-title" ref={titleRef} disabled={!canEditFields} className="tfh-input" placeholder="What needs doing?" value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} style={{ marginBottom: 14, opacity: canEditFields ? 1 : 0.7 }} />
+
+        <label className="tfh-label" htmlFor="tfh-desc">Description</label>
+        <textarea id="tfh-desc" disabled={!canEditFields} className="tfh-input" rows={3} placeholder="Add context so anyone on the team can pick this up" value={draft.description} onChange={(e) => setDraft({ ...draft, description: e.target.value })} style={{ marginBottom: 18, resize: "vertical", opacity: canEditFields ? 1 : 0.7 }} />
+
+        {/* Minutes of what was SAID, kept separate from the description
+            (which is what the activity IS) so a long write-up doesn't bury
+            the brief. Sits above the subtasks because you fill it in after
+            the meeting, working downwards. */}
+        <label className="tfh-label" htmlFor="tfh-notes">
+          Notes from Meeting/Discussion <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(minutes, decisions, follow-ups)</span>
+        </label>
+        <textarea
+          id="tfh-notes" disabled={!canEditFields} className="tfh-input" rows={3}
+          placeholder="What was discussed, what was decided, who does what next"
+          value={draft.meetingNotes || ""}
+          onChange={(e) => setDraft({ ...draft, meetingNotes: e.target.value })}
+          style={{ marginBottom: 18, resize: "vertical", opacity: canEditFields ? 1 : 0.7 }}
+        />
+
+        {SUBTASKS_ENABLED && (<>
+        <label className="tfh-label">Subtasks <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>— mini tasks of their own, each with a time, description, files, and links</span></label>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
+          {draft.subtasks.map((s) => (
+            <SubtaskRow
+              key={s.id} subtask={s} canManage={canEditFields} canAttach={canAttach}
+              workspaceId={workspaceId} projectId={draft.projectId} taskId={draft.id}
+              onToggle={toggleSubtask} onRemove={removeSubtask} onUpdate={updateSubtask}
+            />
+          ))}
+        </div>
+        {canEditFields && (
+          <div style={{ marginBottom: 20 }}>
+            {addingSubtask ? (
+              <NewSubtaskForm onAdd={addSubtask} onCancel={() => setAddingSubtask(false)} />
+            ) : (
+              <button className="tfh-btn tfh-btn-accent" onClick={() => setAddingSubtask(true)}><Plus size={14} /> Add subtask</button>
+            )}
+          </div>
+        )}
+        </>)}
+
+        {/* Who / when sits directly under "Add subtask" — the three fields
+            people fill in on almost every task, kept together and above the
+            filing details (project, stage, priority) they change far less
+            often. */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+          <div>
+            <label className="tfh-label">Assignee</label>
+            <select disabled={!canChangeAssignee} className="tfh-input" value={draft.assigneeId} onChange={(e) => setDraft({ ...draft, assigneeId: e.target.value })} style={{ opacity: canChangeAssignee ? 1 : 0.7 }}>
+              {users.map((m) => <option key={m.id} value={m.id}>{m.name}{m.role === "admin" ? " (Admin)" : m.role === "lead" ? " (Lead)" : ""}</option>)}
+            </select>
+          </div>
+          {/* A second person, for work two staff do together. Optional, and
+              the first assignee is excluded from the list so the same name
+              can't land in both slots — that would double-count the activity
+              on every dashboard and in every report. */}
+          <div>
+            <label className="tfh-label">
+              Assignee 2 <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(optional)</span>
+            </label>
+            <select
+              disabled={!canChangeAssignee} className="tfh-input"
+              value={draft.assignee2Id || ""}
+              onChange={(e) => setDraft({ ...draft, assignee2Id: e.target.value || null })}
+              style={{ opacity: canChangeAssignee ? 1 : 0.7 }}
+              title="Give this activity to a second person as well"
+            >
+              <option value="">— nobody else —</option>
+              {users.filter((m) => m.id !== draft.assigneeId).map((m) => (
+                <option key={m.id} value={m.id}>{m.name}{m.role === "admin" ? " (Admin)" : m.role === "lead" ? " (Lead)" : ""}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="tfh-label">Due date</label>
+            <DateField disabled={!canEditFields} value={draft.due} onChange={(v) => setDraft({ ...draft, due: v })} ariaLabel="Due date" />
+          </div>
+          <div>
+            <label className="tfh-label">Time from <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(optional)</span></label>
+            <input
+              type="time" disabled={!canEditFields} className="tfh-input"
+              value={draft.dueTime || ""}
+              onChange={(e) => {
+                const dueTime = e.target.value;
+                // Clearing the start clears the end too — an end time with
+                // nothing to end is meaningless, and the server rejects it.
+                setDraft({ ...draft, dueTime, endTime: dueTime ? draft.endTime : "" });
+              }}
+              style={{ opacity: canEditFields ? 1 : 0.7 }} aria-label="Start time"
+            />
+          </div>
+          <div>
+            <label className="tfh-label">Time to <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(optional)</span></label>
+            <input
+              type="time" disabled={!canEditFields || !draft.dueTime} className="tfh-input"
+              value={draft.endTime || ""}
+              min={draft.dueTime || undefined}
+              onChange={(e) => setDraft({ ...draft, endTime: e.target.value })}
+              style={{ opacity: canEditFields && draft.dueTime ? 1 : 0.7 }} aria-label="End time"
+              title={draft.dueTime ? "When this finishes" : "Set a start time first"}
+            />
+            {draft.endTime && draft.dueTime && draft.endTime <= draft.dueTime && (
+              <div style={{ fontSize: 11, color: "var(--pri-high)", marginTop: 4 }}>Has to be after the start time.</div>
+            )}
+          </div>
+        </div>
+
+        <RecurrenceField
+          value={draft.recurrence || null}
+          due={draft.due}
+          disabled={!canEditFields}
+          isOccurrence={!!draft.recurrenceParentId}
+          stopRequested={!!draft.stopSeries}
+          onChange={(recurrence) => setDraft({ ...draft, recurrence })}
+          onStopSeries={(stop) => setDraft({ ...draft, stopSeries: stop })}
+        />
+
+        {/* Setting reminders follows the same rule as attaching to a task:
+            its creator, its assignees, and managers (server: canTouchTask). */}
+        <RemindersField draft={draft} setDraft={setDraft} disabled={Boolean(draft.id) && !canAttach} />
+
+        <div style={{ marginBottom: 14 }}>
+          <label className="tfh-label">Project</label>
+          <select
+            disabled={draft.id && !canManage && !isOwnTask} className="tfh-input" value={draft.projectId}
+            onChange={(e) => setDraft({ ...draft, projectId: e.target.value })}
+          >
+            <option value="" disabled>Choose a project…</option>
+            <option value="__general__">No Specific Project (General)</option>
+            {/* Completed projects are filed away — new work doesn't go into
+                them. A task already in one keeps it listed so it still shows. */}
+            {projects.filter((p) => p.name !== "General" && (!p.completedAt || p.id === draft.projectId)).map((p) => <option key={p.id} value={p.id}>{p.name}{p.completedAt ? " (completed)" : ""}</option>)}
+          </select>
+          {draft.id && <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 4 }}>You can move this task to a different project if it was filed by mistake.</div>}
+        </div>
+
+        {/* Stage used to be a dropdown here. It's a two-state field — done
+            or not — so it's now a tick beside the footer buttons, where the
+            decision actually gets made when you're finishing a task. */}
+        <div style={{ marginBottom: 14 }}>
+          <div>
+            <label className="tfh-label">Priority</label>
+            <button
+              type="button" disabled={!canEditFields}
+              onClick={() => setDraft({ ...draft, priority: isUrgent(draft.priority) ? "medium" : "high" })}
+              className="tfh-input"
+              style={{ display: "flex", alignItems: "center", gap: 8, cursor: canEditFields ? "pointer" : "default", opacity: canEditFields ? 1 : 0.7, textAlign: "left", color: isUrgent(draft.priority) ? "var(--pri-high)" : "var(--text-dim)" }}
+            >
+              <span className={`tfh-checkbox ${isUrgent(draft.priority) ? "checked" : ""}`} style={{ pointerEvents: "none" }}>
+                {isUrgent(draft.priority) && <Check size={11} color="var(--accent-ink)" strokeWidth={3} />}
+              </span>
+              <Flag size={13} /> Mark as urgent
+            </button>
+          </div>
+        </div>
+
+        {!draft.id && <PendingFilesLinks draft={draft} setDraft={setDraft} />}
+
+        {draft.id && (
+          <Attachments workspaceId={workspaceId} projectId={draft.projectId} taskId={draft.id} canAttach={canAttach} />
+        )}
+
+        {draft.id && (
+          <Links workspaceId={workspaceId} projectId={draft.projectId} taskId={draft.id} canAttach={canAttach} />
+        )}
+
+        {draft.id && (
+          <Comments workspaceId={workspaceId} projectId={draft.projectId} taskId={draft.id} canComment={true} currentUserId={currentUserId} />
+        )}
+
+        {saveError && (
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, color: "var(--pri-high)", background: "var(--raised)", border: "1px solid var(--pri-high)", padding: "10px 12px", borderRadius: 10, marginTop: 14, lineHeight: 1.5 }}>
+            <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 1 }} /> {saveError}
+          </div>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: "1px solid var(--line)", paddingTop: 16, marginTop: saveError ? 0 : undefined }}>
+          {canDelete ? <DeleteButton onConfirm={() => onDelete(draft.id)} /> : (
+            deleteBlockedReason
+              ? <span style={{ fontSize: 11, color: "var(--text-faint)", maxWidth: 220, lineHeight: 1.4 }} title="Tasks assigned to you can only be deleted by whoever assigned them">{deleteBlockedReason}</span>
+              : <span />
+          )}
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {/* Mark complete — the old Stage dropdown, as a tick. Sits with
+                the footer actions because that's the moment you reach for
+                it: you finish the task, then save. */}
+            {canEditFields && (
+              <button
+                type="button"
+                onClick={() => setDraft({ ...draft, status: draft.status === "done" ? "todo" : "done" })}
+                className="tfh-btn"
+                aria-pressed={draft.status === "done"}
+                title={draft.status === "done" ? "Completed — click to reopen" : "Mark this task complete"}
+                style={{
+                  gap: 7,
+                  borderColor: draft.status === "done" ? "var(--success)" : "var(--line)",
+                  background: draft.status === "done" ? "var(--success-soft)" : "transparent",
+                  color: draft.status === "done" ? "var(--success)" : "var(--text-dim)",
+                  fontWeight: draft.status === "done" ? 600 : 500,
+                }}
+              >
+                <span className={`tfh-checkbox ${draft.status === "done" ? "checked success" : ""}`} style={{ pointerEvents: "none" }}>
+                  {draft.status === "done" && <Check size={11} color="var(--success-ink)" strokeWidth={3} />}
+                </span>
+                {draft.status === "done" ? "Completed" : "Mark complete"}
+              </button>
+            )}
+            {canEditFields ? (
+              <>
+                <button className="tfh-btn" onClick={onClose} disabled={saving}>Cancel</button>
+                <button className="tfh-btn tfh-btn-accent" disabled={!draft.title.trim() || saving} onClick={onSave}>
+                  {uploadPhase ? "Uploading files…" : saving ? "Saving…" : draft.id ? "Save changes" : "Create task"}
+                </button>
+              </>
+            ) : (
+              <button className="tfh-btn tfh-btn-accent" onClick={onClose}>Close</button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Bulk add — paste a day's list of activities at once                   */
+/* ------------------------------------------------------------------ */
+// Matches a leading "Name:" or "Name -" on a line against a workspace member,
+// by full name, first name, or initials — so pasting straight from a log
+// grouped by person (like "Leo: fix the bug") assigns it to the right person
+// without needing a dropdown per line.
+function matchMemberPrefix(line, members) {
+  const m = line.match(/^([A-Za-z][A-Za-z.\s]{0,30}?)\s*[:\-–—]\s+(.+)$/);
+  if (!m) return null;
+  const rawName = m[1].trim().toLowerCase();
+  const rest = m[2].trim();
+  if (!rest) return null;
+
+  const found = members.find((mem) => {
+    const full = mem.name.toLowerCase();
+    const first = mem.name.split(" ")[0].toLowerCase();
+    const initials = mem.initials.toLowerCase();
+    return full === rawName || first === rawName || initials === rawName;
+  });
+  return found ? { member: found, rest } : null;
+}
+
+// Parses the pasted block into one task per non-indented line. A line
+// indented under it (spaces, a tab, or a leading "-"/"*") becomes a subtask
+// of the task directly above it — matching how the source activity logs
+// nest detail bullets under a main line.
+function parseBulkText(text, members, defaultAssigneeId) {
+  const rawLines = text.split("\n");
+  const tasks = [];
+
+  for (const raw of rawLines) {
+    if (!raw.trim()) continue;
+    const isIndented = /^\s/.test(raw) || /^\s*[-*]\s+/.test(raw.trimStart()) && /^\s/.test(raw);
+    const trimmed = raw.trim().replace(/^[-*]\s+/, "");
+
+    if (isIndented && tasks.length > 0) {
+      tasks[tasks.length - 1].subtasks.push(trimmed);
+      continue;
+    }
+
+    const prefixMatch = matchMemberPrefix(trimmed, members);
+    if (prefixMatch) {
+      tasks.push({ title: prefixMatch.rest, assigneeId: prefixMatch.member.id, assigneeName: prefixMatch.member.name, subtasks: [] });
+    } else {
+      const fallback = members.find((m) => m.id === defaultAssigneeId);
+      tasks.push({ title: trimmed, assigneeId: defaultAssigneeId, assigneeName: fallback?.name || "—", subtasks: [] });
+    }
+  }
+  return tasks;
+}
+
+const BulkAddModal = ({ users, projects, currentProjectId, currentUserId, onClose, onSubmit }) => {
+  const [assigneeId, setAssigneeId] = useState(currentUserId || users[0]?.id || "");
+  const [projectId, setProjectId] = useState(currentProjectId || "");
+  const [due, setDue] = useState(localDateStr());
+  const [priority, setPriority] = useState("medium");
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const parsed = parseBulkText(text, users, assigneeId);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (parsed.length === 0) return;
+    if (!projectId) { setError("Choose which project these tasks belong to."); return; }
+    setBusy(true);
+    setError("");
+    try {
+      // With subtasks switched off, the indented detail lines under a task
+      // go into its description as bullets instead — nothing pasted is lost.
+      await onSubmit({
+        tasks: parsed.map((t) => (SUBTASKS_ENABLED
+          ? { title: t.title, assigneeId: t.assigneeId, subtasks: t.subtasks }
+          : { title: t.title, assigneeId: t.assigneeId, subtasks: [], description: t.subtasks.map((line) => `• ${line}`).join("\n") })),
+        due, priority, projectId,
+      });
+      onClose();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="tfh-modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="tfh-card tfh-modal-card" style={{ width: "100%", maxWidth: 620, maxHeight: "88vh", overflowY: "auto", padding: 22 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+          <span className="tfh-display" style={{ fontSize: 19, fontWeight: 600 }}>Add a day's tasks at once</span>
+          <button className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+        <div style={{ fontSize: 12.5, color: "var(--text-dim)", marginBottom: 18, lineHeight: 1.5 }}>
+          Paste one line per task. Start a line with a name to assign it to that
+          person — e.g. <span className="tfh-mono">Leo: fix the Safari bug</span> — otherwise it
+          goes to whoever's picked below. Indent a line underneath a task to add
+          it to that task's {SUBTASKS_ENABLED ? "subtasks" : "description"} instead of making a new task. A leading time like{" "}
+          <span className="tfh-mono">9:00 AM</span> is pulled into its own field automatically.
+        </div>
+
+        <form onSubmit={submit}>
+          <div style={{ marginBottom: 14 }}>
+            <label className="tfh-label">Project <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(all tasks below go here)</span></label>
+            <select className="tfh-input" value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+              <option value="" disabled>Choose a project…</option>
+              <option value="__general__">No Specific Project (General)</option>
+              {projects.filter((p) => p.name !== "General" && !p.completedAt).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+            <div>
+              <label className="tfh-label">Default assignee <span style={{ textTransform: "none", fontWeight: 400 }}>(for lines with no name)</span></label>
+              <select className="tfh-input" value={assigneeId} onChange={(e) => setAssigneeId(e.target.value)}>
+                {users.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="tfh-label">Due date</label>
+              <DateField value={due} onChange={setDue} ariaLabel="Due date for these tasks" />
+            </div>
+            <div>
+              <label className="tfh-label">Priority</label>
+              <button
+                type="button"
+                onClick={() => setPriority((pr) => isUrgent(pr) ? "medium" : "high")}
+                className="tfh-input"
+                style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", textAlign: "left", color: isUrgent(priority) ? "var(--pri-high)" : "var(--text-dim)" }}
+              >
+                <span className={`tfh-checkbox ${isUrgent(priority) ? "checked" : ""}`} style={{ pointerEvents: "none" }}>
+                  {isUrgent(priority) && <Check size={11} color="var(--accent-ink)" strokeWidth={3} />}
+                </span>
+                <Flag size={13} /> Mark all as urgent
+              </button>
+            </div>
+          </div>
+
+          <label className="tfh-label">Tasks</label>
+          <textarea
+            className="tfh-input" rows={7} style={{ resize: "vertical", fontFamily: "IBM Plex Mono, monospace", fontSize: 12.5 }}
+            placeholder={"Leo: 9:00 AM - Meeting with Director\n  Prepare slides\n  Confirm attendees\nSena: Migrate auth to new provider\nDraft the press release"}
+            value={text} onChange={(e) => setText(e.target.value)}
+          />
+
+          {parsed.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, margin: "10px 0 6px", maxHeight: 180, overflowY: "auto" }}>
+              {parsed.map((t, i) => {
+                const member = users.find((m) => m.id === t.assigneeId);
+                return (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 9px", borderRadius: 8, background: "var(--raised)" }}>
+                    <Avatar member={member} size={20} />
+                    <span style={{ fontSize: 12.5, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{t.title}</span>
+                    {t.subtasks.length > 0 && (
+                      <span className="tfh-chip tfh-mono" style={{ background: "var(--panel)", color: "var(--text-faint)", flexShrink: 0 }}>{SUBTASKS_ENABLED ? `${t.subtasks.length} sub` : `+${t.subtasks.length} line${t.subtasks.length === 1 ? "" : "s"}`}</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div style={{ fontSize: 11.5, color: "var(--text-faint)", margin: "6px 0 18px" }}>
+            {parsed.length} task{parsed.length === 1 ? "" : "s"} will be created, all due on the date above.
+          </div>
+
+          {error && <div style={{ fontSize: 12.5, color: "var(--pri-high)", marginBottom: 14 }}>{error}</div>}
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, borderTop: "1px solid var(--line)", paddingTop: 16 }}>
+            <button type="button" className="tfh-btn" onClick={onClose}>Cancel</button>
+            <button className="tfh-btn tfh-btn-accent" disabled={busy || parsed.length === 0}>
+              {busy ? "Creating…" : `Create ${parsed.length || ""} task${parsed.length === 1 ? "" : "s"}`}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Flow meter                                                           */
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Notification bell                                                    */
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Global search                                                        */
+/* ------------------------------------------------------------------ */
+// "Type a name of activity and it shows all similar activities."
+//
+// Tasks are already in memory for the whole workspace, so matching them is
+// instant and needs no request. Logged activities live in the activity-log
+// JSON, so those are fetched once — lazily, on the first search — for the
+// last 90 days, then filtered client-side. That keeps typing responsive
+// instead of firing a request per keystroke.
+const SEARCH_LIMIT = 40;
+const SEARCH_LOOKBACK_DAYS = 90;
+
+// Ranks a match so the closest names come first: an exact title beats a
+// title that starts with the query, which beats one that merely contains
+// it, which beats a hit in the description. Plain substring matching, not
+// fuzzy — people here search by the words actually in the activity.
+const scoreMatch = (title, description, q) => {
+  const t = (title || "").toLowerCase();
+  const d = (description || "").toLowerCase();
+  if (t === q) return 0;
+  if (t.startsWith(q)) return 1;
+  const words = t.split(/\s+/);
+  if (words.some((w) => w.startsWith(q))) return 2;
+  if (t.includes(q)) return 3;
+  if (d.includes(q)) return 4;
+  return -1;
+};
+
+const GlobalSearch = ({ workspaceId, tasks, users, currentUserId, onOpenTask, onOpenActivityDay }) => {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const [logs, setLogs] = useState(null); // null = not fetched yet
+  const [loadingLogs, setLoadingLogs] = useState(false);
+  const [highlight, setHighlight] = useState(0);
+  const ref = useRef(null);
+  const inputRef = useRef(null);
+
+  // Fetch the activity-log side once, the first time someone actually
+  // searches — not on mount, since most sessions never use search.
+  useEffect(() => {
+    if (!query.trim() || logs !== null || loadingLogs) return;
+    setLoadingLogs(true);
+    const to = localDateStr();
+    const from = shiftDateStr(to, -SEARCH_LOOKBACK_DAYS);
+    api.getTeamActivityLogs(workspaceId, from, to)
+      .then((r) => setLogs(r.logs))
+      .catch(() => setLogs([]))
+      .finally(() => setLoadingLogs(false));
+  }, [query, logs, loadingLogs, workspaceId]);
+
+  useEffect(() => {
+    const onClick = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  // Ctrl/Cmd+K focuses search from anywhere — the shortcut people already
+  // expect, and the reason the box can stay compact in the bar.
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        inputRef.current?.focus();
+        setOpen(true);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  const results = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (q.length < 2) return [];
+
+    const taskHits = tasks
+      .map((t) => ({ t, score: scoreMatch(t.title, t.description, q) }))
+      .filter((r) => r.score >= 0)
+      .map((r) => ({
+        kind: "task",
+        score: r.score,
+        // Undated tasks sort last within a score band rather than crashing
+        // the comparator.
+        date: r.t.due || "",
+        task: r.t,
+        title: r.t.title,
+        assignee: users.find((u) => u.id === r.t.assigneeId),
+      }));
+
+    const activityHits = (logs || []).flatMap((log) =>
+      (log.content || [])
+        .filter((b) => b.type === "text" && b.text?.trim())
+        .map((block, blockIndex) => ({ block, blockIndex }))
+        .map(({ block, blockIndex }) => ({ block, blockIndex, score: scoreMatch(block.text, block.notes, q) }))
+        .filter((r) => r.score >= 0)
+        .map((r) => ({
+          kind: "activity",
+          score: r.score,
+          date: log.entryDate,
+          title: r.block.text,
+          block: r.block,
+          entryDate: log.entryDate,
+          logId: log.id,
+          author: users.find((u) => u.id === log.userId) || { name: log.userName, color: log.userColor, initials: log.userInitials },
+        }))
+    );
+
+    return [...taskHits, ...activityHits]
+      .sort((a, b) => a.score - b.score || b.date.localeCompare(a.date))
+      .slice(0, SEARCH_LIMIT);
+  }, [query, tasks, users, logs]);
+
+  useEffect(() => { setHighlight(0); }, [query]);
+
+  const choose = (r) => {
+    setOpen(false);
+    setQuery("");
+    if (r.kind === "task") onOpenTask(r.task);
+    else onOpenActivityDay(r);
+  };
+
+  const onKeyDown = (e) => {
+    if (e.key === "Escape") { setOpen(false); inputRef.current?.blur(); return; }
+    if (!results.length) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); setHighlight((h) => (h + 1) % results.length); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setHighlight((h) => (h - 1 + results.length) % results.length); }
+    else if (e.key === "Enter") { e.preventDefault(); choose(results[highlight]); }
+  };
+
+  const q = query.trim();
+  const showPanel = open && q.length > 0;
+
+  return (
+    <div style={{ position: "relative", flex: "1 1 260px", maxWidth: 340, minWidth: 0 }} ref={ref}>
+      <div className="tfh-search-wrap">
+        <Search size={14} color="var(--text-faint)" style={{ flexShrink: 0 }} />
+        <input
+          ref={inputRef}
+          className="tfh-search-input"
+          placeholder="Search activities…"
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={onKeyDown}
+          aria-label="Search activities"
+        />
+        {query ? (
+          <button className="tfh-btn tfh-btn-ghost" style={{ padding: 3 }} onClick={() => { setQuery(""); inputRef.current?.focus(); }} aria-label="Clear search">
+            <X size={12} />
+          </button>
+        ) : (
+          <span className="tfh-mono tfh-hide-mobile" style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>⌘K</span>
+        )}
+      </div>
+
+      {showPanel && (
+        <div className="tfh-card tfh-fade-in" style={{ position: "absolute", right: 0, left: 0, top: 42, zIndex: 40, padding: 6, maxHeight: 420, overflowY: "auto", minWidth: 300 }}>
+          {q.length < 2 ? (
+            <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "10px 10px" }}>Keep typing…</div>
+          ) : results.length === 0 ? (
+            <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "10px 10px" }}>
+              {loadingLogs ? "Searching…" : `Nothing matches "${q}".`}
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: 10.5, color: "var(--text-faint)", padding: "4px 10px 6px", textTransform: "uppercase", letterSpacing: 0.05, fontWeight: 700 }}>
+                {results.length} match{results.length === 1 ? "" : "es"}{loadingLogs ? " · still loading logged activity" : ""}
+              </div>
+              {results.map((r, i) => (
+                <button
+                  key={`${r.kind}-${r.task?.id || r.logId}-${i}`}
+                  onClick={() => choose(r)}
+                  onMouseEnter={() => setHighlight(i)}
+                  className="tfh-search-result"
+                  style={{ background: i === highlight ? "var(--raised)" : "transparent" }}
+                >
+                  <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flex: 1 }}>
+                    {r.kind === "task"
+                      ? <span style={{ width: 7, height: 7, borderRadius: 999, background: r.task.status === "done" ? "var(--stage-done)" : "var(--stage-progress)", flexShrink: 0 }} />
+                      : <NotebookPen size={12} color="var(--accent)" style={{ flexShrink: 0 }} />}
+                    <span style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.title}</span>
+                  </span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 7, flexShrink: 0 }}>
+                    {r.kind === "task" && r.task.projectName && (
+                      <span className="tfh-chip tfh-hide-mobile" style={{ fontSize: 9.5, background: "var(--raised)", color: "var(--text-faint)", maxWidth: 110, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.task.projectName}</span>
+                    )}
+                    {r.date && <span className="tfh-mono" style={{ fontSize: 10.5, color: "var(--date-scheduled)" }}>{shortDate(r.date)}</span>}
+                    {r.kind === "task" && r.assignee && <Avatar member={r.assignee} size={18} />}
+                    {r.kind === "activity" && r.author && <Avatar member={r.author} size={18} />}
+                  </span>
+                </button>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Appearance — modelled on macOS's System Settings → Appearance: the four
+// themes as little window previews, then a row of accent-colour swatches.
+// Everything here is PERSONAL: it is saved to the signed-in person's own
+// account (see AppearanceSync), follows them to any computer, survives
+// signing out, and is never applied for anyone else.
+//
+// It stays open while you try things — that is how the macOS pane behaves,
+// and closing on every click made comparing two colours a chore.
+const THEME_OPTIONS = [
+  { id: "system", label: "Auto", icon: Monitor, hint: "Follows your device" },
+  { id: "light", label: "Light", icon: Sun, hint: "Cool and bright" },
+  { id: "warm", label: "Warm", icon: Sunset, hint: "Easier on the eyes" },
+  { id: "dark", label: "Dark", icon: Moon, hint: "Low light" },
+];
+
+// One miniature window: sidebar, a card, a highlighted row and a button —
+// drawn with the surfaces and accent as they will actually be painted in
+// THAT theme, tint included, from the same function that paints the app. So
+// you can see your colour in Dark before you switch to Dark.
+const ThemePreviewWindow = ({ themeId, accent, tint }) => {
+  const p = themeSurfaces(accent, themeId, tint);
+  const acc = p.accent;
+  return (
+    <svg viewBox="0 0 60 40" width="100%" height="100%" aria-hidden="true" style={{ display: "block" }}>
+      <rect width="60" height="40" fill={p.page} />
+      <rect x="0" y="0" width="16" height="40" fill={p.panel} />
+      <rect x="3" y="6" width="10" height="3" rx="1.5" fill={acc} opacity="0.9" />
+      <rect x="3" y="12" width="8" height="2" rx="1" fill={p.text} opacity="0.6" />
+      <rect x="3" y="16" width="9" height="2" rx="1" fill={p.text} opacity="0.6" />
+      <rect x="20" y="6" width="36" height="28" rx="3" fill={p.panel} stroke={p.line} strokeWidth="0.75" />
+      <rect x="24" y="11" width="20" height="2.5" rx="1.25" fill={p.text} opacity="0.7" />
+      <rect x="24" y="17" width="26" height="2" rx="1" fill={p.text} opacity="0.45" />
+      <rect x="40" y="26" width="12" height="5" rx="2.5" fill={acc} />
+    </svg>
+  );
+};
+
+const ThemeMenu = () => {
+  const { theme, preference, accent, tint, tintInEffect, systemTheme, setPreference, setAccent, setTint, resetAppearance } = useTheme();
+  const [open, setOpen] = useState(false);
+  const [hoverAccent, setHoverAccent] = useState(null);
+  const ref = useRef(null);
+  const customRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onClick = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onClick);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onClick); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+
+  // The button shows what is actually PAINTED, so the icon always matches
+  // what you are looking at — including when Auto flips at sunset.
+  const painted = THEME_OPTIONS.find((o) => o.id === theme) || THEME_OPTIONS[3];
+  const PaintedIcon = painted.icon;
+  const isCustom = typeof accent === "string" && accent.startsWith("#");
+  const isDefault = preference === "dark" && accent === "damc" && tintInEffect === "off";
+
+  // Swatch colours are the vivid Apple originals; what gets PAINTED is the
+  // contrast-adjusted version (see appearance.js), so a swatch can look a
+  // shade brighter than the same colour used as text on a white page.
+  const swatchColor = (a) =>
+    a.id === "damc" ? a.swatch : theme === "dark" ? a.dark : a.light;
+
+  // Arrow keys move through a radio group, as they do in any native one.
+  const onRadioKeys = (e, items, currentIndex, pick) => {
+    const step = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 0;
+    if (!step) return;
+    e.preventDefault();
+    const next = (currentIndex + step + items.length) % items.length;
+    pick(items[next]);
+    const group = e.currentTarget.closest("[role=radiogroup]");
+    group?.querySelectorAll("[role=radio]")[next]?.focus();
+  };
+
+  // A new selection ends any hover preview, so the name underneath always
+  // describes what is actually chosen — not whichever swatch the pointer
+  // happened to pass on its way to the colour picker.
+  useEffect(() => { setHoverAccent(null); }, [accent]);
+
+  const accentIndex = ACCENTS.findIndex((a) => a.id === accent);
+  const nameFor = (value) =>
+    typeof value === "string" && value.startsWith("#") ? `Custom · ${value.toUpperCase()}` : accentLabel(value);
+  const shownName = hoverAccent ? nameFor(hoverAccent) : nameFor(accent);
+
+  return (
+    <div style={{ position: "relative" }} ref={ref}>
+      <button
+        className="tfh-btn tfh-btn-ghost" style={{ padding: 8 }}
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="dialog" aria-expanded={open}
+        aria-label="Appearance"
+        title="Appearance — theme and accent colour"
+      >
+        <PaintedIcon size={16} />
+      </button>
+
+      {open && (
+        <div className="tfh-card tfh-fade-in tfh-appearance" role="dialog" aria-label="Appearance">
+          <div className="tfh-appearance-heading">Appearance</div>
+          <div className="tfh-appearance-themes" role="radiogroup" aria-label="Theme">
+            {THEME_OPTIONS.map((o, i) => {
+              const active = preference === o.id;
+              return (
+                <button
+                  key={o.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  tabIndex={active ? 0 : -1}
+                  className={`tfh-theme-tile ${active ? "active" : ""}`}
+                  onClick={() => setPreference(o.id)}
+                  onKeyDown={(e) => onRadioKeys(e, THEME_OPTIONS, i, (x) => setPreference(x.id))}
+                  title={o.hint}
+                >
+                  <span className="tfh-theme-tile-preview">
+                    {o.id === "system" ? (
+                      // Auto is drawn as light and dark halves, the way macOS
+                      // draws it — it IS both, depending on the hour.
+                      <span style={{ display: "flex", width: "100%", height: "100%" }}>
+                        <span style={{ width: "50%", overflow: "hidden" }}>
+                          <span style={{ display: "block", width: "200%", height: "100%" }}><ThemePreviewWindow themeId="light" accent={accent} tint={tint} /></span>
+                        </span>
+                        <span style={{ width: "50%", overflow: "hidden", direction: "rtl" }}>
+                          <span style={{ display: "block", width: "200%", height: "100%" }}><ThemePreviewWindow themeId="dark" accent={accent} tint={tint} /></span>
+                        </span>
+                      </span>
+                    ) : (
+                      <ThemePreviewWindow themeId={o.id} accent={accent} tint={tint} />
+                    )}
+                  </span>
+                  <span className="tfh-theme-tile-label">{o.label}</span>
+                </button>
+              );
+            })}
+          </div>
+          {/* Says which way Auto is resolving right now — from what the DEVICE
+              reports, not what's painted, so the hint never lies about what
+              picking Auto would give you. */}
+          <div className="tfh-appearance-hint">
+            {preference === "system"
+              ? `Following your device · ${systemTheme === "dark" ? "dark" : "light"} right now`
+              : THEME_OPTIONS.find((o) => o.id === preference)?.hint}
+          </div>
+
+          <div className="tfh-appearance-heading" style={{ marginTop: 14 }}>Accent colour</div>
+          <div
+            className="tfh-accent-row" role="radiogroup" aria-label="Accent colour"
+            onMouseLeave={() => setHoverAccent(null)}
+          >
+            {ACCENTS.map((a, i) => {
+              const active = accent === a.id;
+              return (
+                <button
+                  key={a.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  aria-label={a.label}
+                  tabIndex={active || (accentIndex === -1 && i === 0) ? 0 : -1}
+                  className={`tfh-accent-swatch ${active ? "active" : ""}`}
+                  style={{ "--swatch": swatchColor(a) }}
+                  onClick={() => setAccent(a.id)}
+                  onMouseEnter={() => setHoverAccent(a.id)}
+                  onFocus={() => setHoverAccent(a.id)}
+                  onBlur={() => setHoverAccent(null)}
+                  onKeyDown={(e) => onRadioKeys(e, ACCENTS, i, (x) => setAccent(x.id))}
+                  title={a.label}
+                />
+              );
+            })}
+            {/* Any colour at all. The native picker, because it is the one
+                people already know on their own computer. Changes paint live
+                as you drag and are saved once you stop. */}
+            <label
+              className={`tfh-accent-swatch custom ${isCustom ? "active" : ""}`}
+              style={isCustom ? { "--swatch": accent } : undefined}
+              title="Custom colour"
+              onMouseEnter={() => setHoverAccent(isCustom ? accent : "#custom")}
+            >
+              <input
+                ref={customRef}
+                type="color"
+                aria-label="Custom accent colour"
+                value={isCustom ? accent : "#3a7bd5"}
+                onInput={(e) => setAccent(e.target.value)}
+                onChange={(e) => setAccent(e.target.value)}
+              />
+            </label>
+          </div>
+          <div className="tfh-appearance-accent-name">
+            {hoverAccent === "#custom" ? "Custom…" : shownName}
+          </div>
+
+          {/* How far the colour reaches into the page itself. A segmented
+              control, as macOS draws two- and three-way choices. The tint
+              changes the HUE of every surface but holds its brightness, so
+              nothing becomes harder to read at any setting. */}
+          <div className="tfh-appearance-heading" style={{ marginTop: 14 }}>Background tint</div>
+          <div className="tfh-segmented" role="radiogroup" aria-label="Background tint">
+            {TINT_LEVELS.map((level, i) => {
+              const active = tintInEffect === level;
+              return (
+                <button
+                  key={level}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  tabIndex={active ? 0 : -1}
+                  className={`tfh-segment ${active ? "active" : ""}`}
+                  onClick={() => setTint(level)}
+                  onKeyDown={(e) => onRadioKeys(e, TINT_LEVELS, i, (x) => setTint(x))}
+                >
+                  {level === "off" ? "Off" : level === "subtle" ? "Subtle" : "Rich"}
+                </button>
+              );
+            })}
+          </div>
+          <div className="tfh-appearance-hint">
+            {tintInEffect === "off"
+              ? "Only buttons and highlights take the colour."
+              : tintInEffect === "subtle"
+                ? "The page and cards take a hint of the colour."
+                : "The whole interface is washed in the colour."}
+          </div>
+
+          <div className="tfh-appearance-footer">
+            <span>Only you see this. It follows you to any computer you sign in on, and stays after you sign out.</span>
+            {!isDefault && (
+              <button type="button" className="tfh-appearance-reset" onClick={resetAppearance}>
+                Reset
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// The account control, in the top bar next to Quick add / notifications /
+// theme — where every other app puts it, and where there's room for the
+// full name. It used to be a block pinned to the bottom of the sidebar,
+// which truncated long names to "Sangay Thi…" and put Sign out one
+// mis-click away from the profile button.
+//
+// Same dropdown mechanics as NotificationBell above (click-outside +
+// Escape), deliberately — two popovers in one bar behaving differently
+// would be worse than the small duplication.
+const AccountMenu = ({ member, authUser, onEditProfile, onSignOut }) => {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onClick);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onClick); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+
+  const act = (fn) => { setOpen(false); fn(); };
+
+  return (
+    <div style={{ position: "relative" }} ref={ref}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className={`tfh-account-trigger ${open ? "open" : ""}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title={member?.name}
+      >
+        <Avatar member={member} size={26} />
+        {/* Name hides on narrow screens — the avatar alone is the control
+            there, rather than an ellipsised name taking the whole bar. */}
+        <span className="tfh-hide-mobile tfh-account-name">{member?.name}</span>
+        <ChevronDown size={13} color="var(--text-faint)" style={{ flexShrink: 0, transition: "transform 0.15s ease", transform: open ? "rotate(180deg)" : "none" }} />
+      </button>
+
+      {open && (
+        <div className="tfh-card tfh-fade-in" role="menu" style={{ position: "absolute", right: 0, top: 44, width: 268, zIndex: 30, padding: 0, overflow: "hidden" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 11, padding: "14px 14px 13px", borderBottom: "1px solid var(--line)" }}>
+            <Avatar member={member} size={38} />
+            <div style={{ minWidth: 0, flex: 1 }}>
+              {/* Full name, wrapping rather than truncating — the reason
+                  this moved out of the sidebar in the first place. */}
+              <div style={{ fontSize: 13.5, fontWeight: 700, lineHeight: 1.3 }}>{member?.name}</div>
+              {member?.title && <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 1 }}>{member.title}</div>}
+              {authUser?.email && (
+                <div className="tfh-mono" style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {authUser.email}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {(member?.role || authUser?.isPlatformAdmin) && (
+            <div style={{ padding: "10px 14px 0", display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {authUser?.isPlatformAdmin && <span className="tfh-chip" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}><Crown size={10} /> Super Admin</span>}
+              {member?.role && !member.superAdminAccess && <RoleBadge role={member.role} />}
+            </div>
+          )}
+
+          <div style={{ padding: 8, display: "flex", flexDirection: "column", gap: 2 }}>
+            <button role="menuitem" className="tfh-account-item" onClick={() => act(onEditProfile)}>
+              <Pencil size={14} /> Edit profile
+            </button>
+            <button role="menuitem" className="tfh-account-item danger" onClick={() => act(onSignOut)}>
+              <LogOut size={14} /> Sign out
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const NotificationBell = ({ notifications, onOpenTask, onMarkRead, onMarkAll, permission, onRequestPermission }) => {
+  const [open, setOpen] = useState(false);
+  const unread = notifications.filter((n) => !n.read).length;
+  const ref = useRef(null);
+  const prevUnread = useRef(unread);
+  const [ringing, setRinging] = useState(false);
+
+  useEffect(() => {
+    if (unread > prevUnread.current) {
+      setRinging(true);
+      const t = setTimeout(() => setRinging(false), 600);
+      prevUnread.current = unread;
+      return () => clearTimeout(t);
+    }
+    prevUnread.current = unread;
+  }, [unread]);
+
+  useEffect(() => {
+    const onClick = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  return (
+    <div style={{ position: "relative" }} ref={ref}>
+      <button className={`tfh-btn tfh-btn-ghost ${ringing ? "tfh-bell-ring" : ""}`} style={{ padding: 8, position: "relative" }} onClick={() => setOpen((o) => !o)} aria-label="Notifications">
+        <Bell size={17} />
+        {unread > 0 && <span className="tfh-badge-dot" />}
+      </button>
+      {open && (
+        <div className="tfh-card tfh-fade-in" style={{ position: "absolute", right: 0, top: 42, width: 340, maxHeight: 420, overflowY: "auto", zIndex: 30, padding: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "4px 6px 10px" }}>
+            <span style={{ fontSize: 13, fontWeight: 700 }}>Notifications</span>
+            <button className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11.5, padding: "4px 8px" }} onClick={onMarkAll}>Mark all read</button>
+          </div>
+          {permission !== "granted" && (
+            <button className="tfh-btn" style={{ width: "100%", marginBottom: 8, fontSize: 12 }} onClick={onRequestPermission}>
+              Enable desktop alerts
+            </button>
+          )}
+          {notifications.length === 0 && (
+            <div style={{ fontSize: 12.5, color: "var(--text-faint)", padding: "16px 8px", textAlign: "center" }}>Nothing yet — you'll see it here the moment it happens.</div>
+          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {notifications.map((n, i) => (
+              <button
+                key={n.id}
+                className="tfh-stagger"
+                onClick={() => { onMarkRead(n.id); if (n.taskId) onOpenTask(n.taskId); setOpen(false); }}
+                style={{ textAlign: "left", background: n.read ? "transparent" : "var(--accent-soft)", border: "1px solid var(--line)", borderRadius: 10, padding: 10, display: "flex", flexDirection: "column", gap: 3 }}
+              >
+                <span style={{ fontSize: 11, color: "var(--accent)", fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.03 }}>{NOTIF_LABEL[n.type] || n.type}</span>
+                <span style={{ fontSize: 12.5, color: "var(--text)" }}>{n.message}</span>
+                <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{timeAgo(n.createdAt)}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Dashboard view                                                        */
+/* ------------------------------------------------------------------ */
+const TaskListMini = ({ title, items, users, onOpen, emptyText, showAssignee }) => (
+  <div className="tfh-card" style={{ padding: 20 }}>
+    <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 14 }}>{title}</div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      {items.map((t) => {
+        const meta = dueMeta(t.due, t.status);
+        const a = memberById(users, t.assigneeId);
+        return (
+          <button key={t.id} onClick={() => onOpen(t)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 8px", borderRadius: 10, background: "transparent", border: "none", color: "var(--text)", textAlign: "left" }}>
+            <span style={{ width: 7, height: 7, borderRadius: 999, background: STAGES.find((s) => s.id === t.status).color, flexShrink: 0 }} />
+            {t.dueTime && <span className="tfh-mono" style={{ fontSize: 11.5, color: "var(--clock)", flexShrink: 0 }}>{formatTimeRange(t.dueTime, t.endTime)}</span>}
+            <span style={{ fontSize: 13.5, flex: 1, color: t.status === "done" ? "var(--text-dim)" : "var(--text)" }}>{t.title}</span>
+            <PriorityChip level={t.priority} />
+            <span style={{ fontSize: 12, color: meta.tone, minWidth: 92, textAlign: "right" }}>{meta.label}</span>
+            {showAssignee && <Avatar member={a} size={22} />}
+          </button>
+        );
+      })}
+      {items.length === 0 && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>{emptyText}</div>}
+    </div>
+  </div>
+);
+
+// Merges tasks due today with today's activity-log text blocks into one
+// time-sorted agenda. Timed items (has a specific clock time) come first in
+// order; untimed items follow. Only tasks can be "upcoming" — you can't log
+// activity for a day that hasn't happened yet, so that concept doesn't
+// apply to the activity-log side of this merge.
+// A logged activity is one text block inside one person's day entry. It
+// carries no id of its own, so an agenda row keeps everything needed to
+// show it in full on click: the block itself, whose log it came from, and
+// which day. (Blocks are positional within the entry, hence blockIndex —
+// enough to identify the row for a React key without inventing ids that the
+// stored JSON doesn't have.)
+const activityItemsFrom = (logEntry, author) =>
+  ((logEntry?.content) || [])
+    .map((block, blockIndex) => ({ block, blockIndex }))
+    .filter(({ block }) => block.type === "text" && block.text?.trim())
+    .map(({ block, blockIndex }) => ({
+      time: block.time || null,
+      label: block.text,
+      kind: "activity",
+      status: block.status,
+      block,
+      blockIndex,
+      logId: logEntry.id,
+      entryDate: logEntry.entryDate,
+      author,
+    }));
+
+// One activity can be given to two people. Every "is this theirs?" test in
+// the app goes through here, so a second assignee sees the work on their own
+// dashboard exactly as the first does — a second slot that only shows up in
+// the dialog would be decorative.
+const isAssignedTo = (task, userId) =>
+  Boolean(userId) && (task.assigneeId === userId || task.assignee2Id === userId);
+
+const mergeAgenda = (tasksToday, logEntry, author) => {
+  const items = [
+    ...tasksToday.map((t) => ({ time: t.dueTime || null, endTime: t.endTime || null, label: t.title, kind: "task", task: t })),
+    ...activityItemsFrom(logEntry, author),
+  ];
+  // Latest first, by the Chief's instruction: the evening's work sits at the
+  // top of the day's card and the morning's at the bottom. Only THIS list is
+  // reversed — Upcoming and Pending still read forwards, because those are
+  // about what is coming rather than what has happened.
+  const timed = items.filter((i) => i.time).sort((a, b) => b.time.localeCompare(a.time));
+  const untimed = items.filter((i) => !i.time);
+  return [...timed, ...untimed];
+};
+
+// Day-first and spelled out by hand, NOT via toLocaleDateString. That helper
+// orders by the BROWSER's locale, so the same heading reads "30 Sept" for one
+// person and "Sept 30" for another and the markup can't control it — the same
+// trap that made every date input dd/mm/yyyy by hand (see DateField). This
+// office reads day-first, so that is what is written here, always.
+const WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+// "Sept", not "Sep" — four letters for September is what this office writes,
+// and it is the one month where the three-letter form looks wrong to them.
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"];
+
+// Noon, not midnight: a date-only string parsed at midnight can fall on the
+// previous day once a timezone offset is applied, which would print the wrong
+// weekday against the right date — the worst kind of wrong.
+const dateParts = (dateStr) => {
+  const [y, m, d] = String(dateStr || "").slice(0, 10).split("-").map(Number);
+  if (!y || !m || !d) return null;
+  return { y, m, d, weekday: new Date(y, m - 1, d, 12).getDay() };
+};
+
+const shortDate = (dateStr) => {
+  const p = dateParts(dateStr);
+  return p ? `${p.d} ${MONTH_NAMES[p.m - 1]}` : "";
+};
+
+// The heading form: weekday first, because when you are planning "Wednesday"
+// is what you think in and "30 Sept" is what you check it against. Only the
+// agenda headings use this — the tight inline dates on search results and
+// board cards stay short, where a weekday would cost more room than it earns.
+const dayAndDate = (dateStr) => {
+  const p = dateParts(dateStr);
+  return p ? `${WEEKDAY_NAMES[p.weekday]} ${p.d} ${MONTH_NAMES[p.m - 1]}` : "";
+};
+
+// Recently completed tasks + past (non-today) logged activity, newest
+// first — the "Past" tab's content. Activity log entries here come from a
+// wider date-range fetch, not the today-only one.
+const buildPastItems = (pastTasks, pastLogEntries, author) => {
+  const items = [
+    ...pastTasks.map((t) => ({ dateStr: t.due, dateLabel: dayAndDate(t.due), label: t.title, kind: "task", task: t })),
+    ...pastLogEntries.flatMap((l) =>
+      activityItemsFrom(l, author).map((item) => ({ ...item, dateStr: l.entryDate, dateLabel: dayAndDate(l.entryDate) }))
+    ),
+  ];
+  return items.sort((a, b) => b.dateStr.localeCompare(a.dateStr));
+};
+
+// dateTone lets a caller colour the date column for what the list MEANS —
+// overdue dates in the priority red, completed ones in the done colour —
+// rather than every date-led list looking identical. Defaults to the normal
+// scheduled-date colour.
+// `time`/`endTime` ride along so a scheduled activity shows its clock time
+// in the row's left gutter — under a date heading that gutter is otherwise
+// empty, which is exactly where the Chief asked for the time to sit. Untimed
+// activities leave it blank rather than printing a placeholder.
+const buildUpcomingItems = (upcomingTasks, dateTone) =>
+  upcomingTasks.map((t) => ({
+    dateStr: t.due, dateLabel: dayAndDate(t.due), label: t.title,
+    time: t.dueTime || null, endTime: t.endTime || null,
+    kind: "task", task: t, dateTone,
+  }));
+
+// "Assigned by <person>" — their actual face and name, not a line of grey
+// text, because the point is to recognise WHO at a glance. Absent when the
+// task was entered by the person who has to do it, and absent when we don't
+// know who created it (rows from before the name was surfaced).
+//
+// `compact` is the board-card form: avatar and first name only, since a card
+// is a fraction of a row's width.
+const AssignedByChip = ({ task, compact }) => {
+  const { membersById } = useContext(ViewerContext);
+  const ownerId = useContext(AgendaOwnerContext);
+  if (!task?.createdBy || !task.createdByName) return null;
+  // The question is "did THIS person enter it themselves?" — never "did the
+  // person looking at the screen create it" (that hid the attribution in the
+  // Team column, where a supervisor needs to see he gave the task out).
+  //
+  // Which person? Whoever the row is being shown FOR. A list that belongs to
+  // someone (your dashboard, a member's card in Team Members) says so through
+  // AgendaOwnerContext. Comparing against assignee 1 only was the Assignee 2
+  // bug: Sonam creates an activity for herself and Karma, and on KARMA's card
+  // the chip was hidden because Sonam is assignee 1 — exactly the case where
+  // Karma needs to see who gave it to him.
+  if (ownerId && isAssignedTo(task, ownerId)) {
+    if (task.createdBy === ownerId) return null;
+  } else {
+    // No owner (board cards, mixed lists): hide only when EVERY assignee is
+    // the creator, i.e. it's purely self-entered work.
+    const assignees = [task.assigneeId, task.assignee2Id].filter(Boolean);
+    if (assignees.length > 0 && assignees.every((id) => id === task.createdBy)) return null;
+  }
+
+  // The roster entry carries the colour, initials and photo. Falling back to
+  // a name-only member keeps the chip working for someone who has since left
+  // the workspace rather than dropping the attribution entirely.
+  const person = membersById?.get(task.createdBy) || { id: task.createdBy, name: task.createdByName, initials: initialsOf(task.createdByName) };
+  const shown = compact ? String(task.createdByName).split(" ")[0] : task.createdByName;
+
+  return (
+    <span
+      className="tfh-assigned-by"
+      title={`Assigned by ${task.createdByName}`}
+    >
+      <Avatar member={person} size={compact ? 14 : 17} />
+      {!compact && <span className="tfh-assigned-by-label">from</span>}
+      <span className="tfh-assigned-by-name">{shown}</span>
+    </span>
+  );
+};
+
+// Two letters from a name, matching how the server builds them, so a person
+// missing from the roster still gets a sensible avatar rather than a blank.
+const initialsOf = (name) =>
+  String(name || "")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((part) => part[0] || "")
+    .join("")
+    .toUpperCase() || "?";
+
+const AgendaRow = ({ item, onOpen, onOpenActivity, grouped }) => {
+  // Both kinds of row are clickable now: a task opens the task dialog, a
+  // logged activity opens its own read-only detail (it isn't a task, so it
+  // has no dialog of its own — see ActivityDetailModal).
+  const activate =
+    item.kind === "task" ? () => onOpen(item.task)
+    : item.kind === "activity" && onOpenActivity ? () => onOpenActivity(item)
+    : null;
+
+  return (
+  <div style={{ display: "flex", flexDirection: "column" }}>
+    <div
+      onClick={activate || undefined}
+      onKeyDown={activate ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activate(); } } : undefined}
+      role={activate ? "button" : undefined}
+      tabIndex={activate ? 0 : undefined}
+      className={activate ? "tfh-agenda-row" : undefined}
+      style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "7px 8px", borderRadius: 8, cursor: activate ? "pointer" : "default" }}
+    >
+      {/* Dates get their own colour and a little weight — as plain
+          --text-faint grey they read as disabled rather than as the
+          schedule. Clock times stay brand green, so the two never blur
+          into each other. */}
+      {/* Inside a date group the heading already carries the date, so an
+          untimed row shows nothing here rather than a column of "Anytime". */}
+      {(item.time || item.dateLabel || !grouped) && (
+        <span
+          className="tfh-mono tfh-agenda-time"
+          style={{
+            fontWeight: item.dateLabel ? 600 : 400,
+            color: item.time ? "var(--clock)" : item.dateLabel ? (item.dateTone || "var(--date-scheduled)") : "var(--text-faint)",
+          }}
+        >
+          {item.time ? formatTimeRange(item.time, item.endTime) : item.dateLabel || "Anytime"}
+        </span>
+      )}
+      <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <span
+          style={{
+            fontSize: 12.5,
+            color: (item.kind === "task" && item.task.status === "done") || item.status === "done" ? "var(--text-dim)" : "var(--text)",
+            textDecoration: item.status === "done" ? "line-through" : "none",
+          }}
+        >
+          {item.label}
+        </span>
+        {item.kind === "task" && <PriorityChip level={item.task.priority} />}
+        {item.kind === "activity" && <ActivityStatusChip status={item.status} />}
+        {/* An activity carrying extra detail advertises it, so it's obvious
+            there's something behind the click rather than a dead row. */}
+        {item.kind === "activity" && (item.block?.notes || (item.block?.links || []).length > 0) && (
+          <span className="tfh-chip" style={{ fontSize: 9.5, background: "var(--raised)", color: "var(--text-faint)" }}>
+            {(item.block.links || []).length > 0 ? <Link2 size={9} /> : <FileText size={9} />} details
+          </span>
+        )}
+        {/* A date-led row that is NOT inside a date group still shows its
+            date in the gutter, so its time goes on the right instead of
+            being lost. Inside a group the gutter already carries the time. */}
+        {item.kind === "task" && item.dateLabel && !item.time && item.task.dueTime && (
+          <span className="tfh-mono" style={{ fontSize: 10.5, color: "var(--clock)", marginLeft: "auto" }}>{formatTimeRange(item.task.dueTime, item.task.endTime)}</span>
+        )}
+      </div>
+      {/* Who gave you this. A SIBLING of the title block, not inside it: the
+          title block wraps its chips, and an attribution that wraps onto its
+          own line under a long title is exactly the untidiness this is meant
+          to avoid. Out here it stays pinned to the right edge on one line,
+          however long the title runs. Shown ONLY when someone else created
+          it — a task you entered yourself needs no attribution, and
+          "assigned by you" on every row is noise. */}
+      {item.kind === "task" && <AssignedByChip task={item.task} />}
+    </div>
+    {/* A task's latest comment shows indented right under it — so a
+        supervisor's note on a member's task/activity appears alongside it in
+        Team Collabs, not hidden inside the task dialog. */}
+    {/* Supervisor notes read red-ish — they're feedback that needs acting
+        on, not more grey body text to scroll past. --comment-note, not
+        --pri-high: the full-strength red made a Pending block with several
+        notes in it genuinely hard to look at on the dark theme. */}
+    {item.kind === "task" && item.task.lastCommentBody && (
+      <div onClick={() => onOpen(item.task)} style={{ marginLeft: item.dateLabel ? 62 : 66, marginBottom: 4, paddingLeft: 10, borderLeft: "2px solid var(--comment-note-line)", cursor: "pointer" }}>
+        <span style={{ fontSize: 11, color: "var(--comment-note)", fontWeight: 500 }}>
+          <MessageSquare size={9} style={{ display: "inline", marginRight: 4, verticalAlign: "middle" }} />
+          {item.task.lastCommentAuthor ? `${item.task.lastCommentAuthor}: ` : ""}{item.task.lastCommentBody}
+          {item.task.commentCount > 1 ? `  (+${item.task.commentCount - 1} more)` : ""}
+        </span>
+      </div>
+    )}
+  </div>
+  );
+};
+
+// A logged activity has no task dialog of its own — it's a block of text
+// inside someone's day entry. This shows everything that block holds (time,
+// what was worked on, notes, project, links) plus who logged it and when,
+// read-only, with a way through to the full Collaboration Log entry.
+const ActivityDetailModal = ({ item, projects, onClose, currentUserId, onSetStatus }) => {
+  const block = item.block || {};
+  const links = block.links || [];
+  const [status, setStatus] = useState(block.status || null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  // Only the person whose log this is can mark it off — the server enforces
+  // the same rule, this just doesn't offer what would be refused.
+  const isMine = item.author?.id && item.author.id === currentUserId;
+
+  const changeStatus = async (next) => {
+    setBusy(true); setError("");
+    try {
+      await onSetStatus(item, next);
+      setStatus(next);
+    } catch (err) {
+      setError(err.message || "Couldn't update that.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const projectName = projects?.find((p) => p.id === block.projectId)?.name;
+  const dayLabel = item.entryDate
+    ? new Date(`${item.entryDate}T00:00:00`).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })
+    : "";
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div className="tfh-modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="tfh-card tfh-modal-card" style={{ width: "100%", maxWidth: 480, maxHeight: "88vh", overflowY: "auto", padding: 22 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 14 }}>
+          <div>
+            <span className="tfh-display" style={{ fontSize: 19, fontWeight: 600 }}>Logged activity</span>
+            <div style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 2 }}>{dayLabel}</div>
+          </div>
+          <button className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+          {item.author && <Avatar member={item.author} size={24} />}
+          <span style={{ fontSize: 12.5, fontWeight: 600 }}>{item.author?.name || "Team member"}</span>
+          {block.time && (
+            <span className="tfh-chip tfh-mono" style={{ background: "var(--clock-soft)", color: "var(--clock)" }}>
+              <Clock size={10} /> {formatTimeLabel(block.time)}
+            </span>
+          )}
+          {projectName && (
+            <span className="tfh-chip" style={{ background: "var(--raised)", color: "var(--text-dim)" }}>
+              <FolderKanban size={10} /> {projectName}
+            </span>
+          )}
+        </div>
+
+        <label className="tfh-label">What was worked on</label>
+        <div style={{ fontSize: 13.5, lineHeight: 1.55, whiteSpace: "pre-wrap", background: "var(--raised)", padding: "11px 13px", borderRadius: 10, marginBottom: 14 }}>
+          {block.text}
+        </div>
+
+        {block.notes && (
+          <>
+            <label className="tfh-label">Notes from activity</label>
+            <div style={{ fontSize: 12.5, lineHeight: 1.5, whiteSpace: "pre-wrap", color: "var(--text-dim)", marginBottom: 14 }}>{block.notes}</div>
+          </>
+        )}
+
+        {links.length > 0 && (
+          <>
+            <label className="tfh-label">Links</label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+              {links.map((l, i) => (
+                <a
+                  key={i} href={l.url} target="_blank" rel="noopener noreferrer"
+                  style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, color: "var(--accent)", textDecoration: "none", background: "var(--raised)", padding: "8px 10px", borderRadius: 8 }}
+                >
+                  <Link2 size={12} style={{ flexShrink: 0 }} />
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.label || l.url}</span>
+                </a>
+              ))}
+            </div>
+          </>
+        )}
+
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap", borderTop: "1px solid var(--line)", paddingTop: 16 }}>
+          {isMine ? (
+            <ActivityStatusPicker status={status} busy={busy} onChange={changeStatus} />
+          ) : status ? (
+            <ActivityStatusChip status={status} size={11} />
+          ) : (
+            <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>Only {item.author?.name || "the owner"} can mark this off</span>
+          )}
+          <button className="tfh-btn tfh-btn-accent" onClick={onClose}>Close</button>
+        </div>
+        {error && <div style={{ fontSize: 12, color: "var(--pri-high)", marginTop: 8, textAlign: "right" }}>{error}</div>}
+      </div>
+    </div>
+  );
+};
+
+// Date-led lists used to repeat the date on every row ("18 Sept", "18 Sept",
+// "24 Sept"…), which reads as noise once a day has more than one activity.
+// This groups consecutive rows under a single date heading with a rule down
+// the side, the way a diary or a comment thread does it.
+//
+// Rows WITHOUT a dateLabel (today's agenda, which is time-led) pass straight
+// through ungrouped — grouping those under one heading would say nothing.
+const GroupedAgenda = ({ items, onOpen, onOpenActivity }) => {
+  const groups = [];
+  for (const item of items) {
+    if (!item.dateLabel) { groups.push({ date: null, items: [item] }); continue; }
+    const last = groups[groups.length - 1];
+    if (last && last.date === item.dateLabel) last.items.push(item);
+    else groups.push({ date: item.dateLabel, items: [item] });
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column" }}>
+      {groups.map((group, gi) =>
+        group.date === null ? (
+          <AgendaRow key={`u${gi}`} item={group.items[0]} onOpen={onOpen} onOpenActivity={onOpenActivity} />
+        ) : (
+          <div key={`${group.date}-${gi}`} style={{ marginBottom: 6 }}>
+            <div className="tfh-mono" style={{ fontSize: 11.5, fontWeight: 700, color: "var(--date-scheduled)", padding: "6px 2px 3px" }}>
+              {group.date}
+            </div>
+            <div style={{ borderLeft: "2px solid var(--line)", marginLeft: 6, paddingLeft: 8 }}>
+              {group.items.map((item, i) => (
+                // dateLabel is stripped so the row shows its time (or
+                // nothing) instead of repeating the heading it sits under.
+                <AgendaRow key={i} grouped item={{ ...item, dateLabel: null }} onOpen={onOpen} onOpenActivity={onOpenActivity} />
+              ))}
+            </div>
+          </div>
+        )
+      )}
+    </div>
+  );
+};
+
+const AgendaCard = ({ title, items, onOpen, onOpenActivity, emptyText }) => (
+  <div className="tfh-card" style={{ padding: 18 }}>
+    <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 8 }}>{title}</div>
+    {items.length === 0 ? (
+      <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "4px 8px" }}>{emptyText}</div>
+    ) : (
+      <div style={{ display: "flex", flexDirection: "column" }}>
+        <GroupedAgenda items={items} onOpen={onOpen} onOpenActivity={onOpenActivity} />
+      </div>
+    )}
+  </div>
+);
+
+// Collapsed by default (name + a compact count), expandable on click — the
+// fix for "looks packed" once there are several team members: previously
+// every single person's full agenda rendered at once, stacking up fast.
+const TeamMemberAgenda = ({ member, items, onOpen, onOpenActivity, emptyText, onAssignTask, pendingCount, dragProps, dragging }) => {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div
+      className="tfh-card"
+      {...(dragProps || {})}
+      style={{ padding: expanded ? 16 : "10px 14px", opacity: dragging ? 0.45 : 1, cursor: dragProps ? "grab" : undefined }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <button
+          onClick={() => setExpanded((e) => !e)}
+          style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0, background: "none", border: "none", cursor: "pointer", padding: 0 }}
+          title={dragProps ? `${member.name} — drag to reorder` : member.name}
+        >
+          <Avatar member={member} size={22} />
+          <span style={{ fontSize: 12.5, fontWeight: 700, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.name}</span>
+        </button>
+        {/* Assign Task → opens Quick Add prefilled for this member */}
+        <button
+          onClick={(e) => { e.stopPropagation(); onAssignTask(member); }}
+          className="tfh-btn tfh-btn-ghost"
+          style={{ fontSize: 11, padding: "3px 8px", flexShrink: 0 }}
+          title={`Initiate a collab with ${member.name}`}
+        >
+          <Plus size={12} /> Initiate Collab
+        </button>
+        {/* Bigger, red item count (the Chief asked for larger red numbers) */}
+        <button onClick={() => setExpanded((e) => !e)} style={{ background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+          {items.length > 0 && (
+            <span style={{ fontSize: 15, fontWeight: 800, color: "var(--pri-high)" }}>{items.length}</span>
+          )}
+          {expanded ? <ChevronUp size={14} color="var(--text-faint)" /> : <ChevronDown size={14} color="var(--text-faint)" />}
+        </button>
+      </div>
+      {expanded && (
+        <div className="tfh-expand-in" style={{ marginTop: 10 }}>
+          {items.length > 0 ? (
+            <AgendaOwnerContext.Provider value={member.id}>
+              <GroupedAgenda items={items} onOpen={onOpen} onOpenActivity={onOpenActivity} />
+            </AgendaOwnerContext.Provider>
+          ) : (
+            <div style={{ fontSize: 11.5, color: "var(--text-faint)", padding: "0 8px" }}>{emptyText}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+
+const TEAM_TABS = [
+  { id: "past", label: "Past" },
+  { id: "today", label: "Today" },
+  { id: "upcoming", label: "Upcoming" },
+  { id: "pending", label: "Pending" },
+];
+
+// The filter on my own "Today's Collabs" card. Upcoming and Pending keep
+// their own cards below, so this strip is only about what the TOP card
+// shows. "Complete" and "Pending" used to be buttons that navigated to the
+// Board; they now swap this card's list in place instead.
+//
+// "Past" is the diary — finished tasks AND logged activity from before
+// today. "Complete" is tasks only, today's included, which is what the old
+// Complete button showed on the Board. Different questions, so both stay.
+const MY_VIEWS = [
+  { id: "today", label: "Today", title: "My Today's Collabs" },
+  { id: "past", label: "Past", title: "My Past Collabs" },
+  { id: "complete", label: "Complete", title: "My Completed Collabs" },
+  { id: "pending", label: "Pending", title: "My Pending Collabs" },
+];
+
+// "All Teams Collabs Today" — one flat, time-ordered picture of everything
+// the whole team did on ONE day, rather than per-person blocks you have to
+// expand one at a time. Deliberately a different shape from the per-member
+// tabs: the question it answers is "what happened that day", not "what is
+// this person doing".
+//
+// The day is a free date picker, not just today, so the same view answers
+// the question for any past day too. Team logs for the chosen day are
+// fetched on demand (the dashboard's standing fetch only covers the last 30
+// days), while tasks are already in memory for the whole workspace.
+const AllTeamsCollabsPanel = ({ workspaceId, day, setDay, tasks, users, currentUser, onOpen, onOpenActivity }) => {
+  const [dayLogs, setDayLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    api.getTeamActivityLogs(workspaceId, day, day)
+      .then((r) => { if (!cancelled) setDayLogs(r.logs); })
+      .catch(() => { if (!cancelled) setDayLogs([]); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [workspaceId, day]);
+
+  const rows = useMemo(() => {
+    const byUser = new Map(users.map((u) => [u.id, u]));
+    const items = [
+      ...tasks
+        .filter((t) => t.due === day)
+        .map((t) => ({ time: t.dueTime || null, endTime: t.endTime || null, label: t.title, kind: "task", task: t, person: byUser.get(t.assigneeId) })),
+      ...dayLogs.flatMap((log) =>
+        activityItemsFrom(log, byUser.get(log.userId) || { name: log.userName, color: log.userColor, initials: log.userInitials })
+          .map((item) => ({ ...item, person: item.author }))
+      ),
+    ];
+    const timed = items.filter((i) => i.time).sort((a, b) => a.time.localeCompare(b.time));
+    const untimed = items.filter((i) => !i.time);
+    return [...timed, ...untimed];
+  }, [tasks, dayLogs, users, day]);
+
+  const doneCount = rows.filter((r) => r.kind === "activity" || r.task?.status === "done").length;
+  const peopleCount = new Set(rows.map((r) => r.person?.id).filter(Boolean)).size;
+  const isToday = day === localDateStr();
+
+  const shiftDay = (delta) => setDay(shiftDateStr(day, delta));
+
+  return (
+    <div className="tfh-card tfh-fade-in" style={{ padding: 18 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+        <div>
+          <div style={{ fontSize: 12.5, fontWeight: 700 }}>All Teams Collabs</div>
+          <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 2 }}>
+            {loading ? "Loading the day…" : `${rows.length} item${rows.length === 1 ? "" : "s"} across ${peopleCount} ${peopleCount === 1 ? "person" : "people"} · ${doneCount} logged or completed`}
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <button className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={() => shiftDay(-1)} aria-label="Previous day"><ChevronLeft size={14} /></button>
+          <DateField
+            value={day} onChange={(v) => v && setDay(v)}
+            style={{ width: 160 }} ariaLabel="Pick a day"
+          />
+          <button className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={() => shiftDay(1)} aria-label="Next day"><ChevronRight size={14} /></button>
+          {!isToday && (
+            <button className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11, padding: "4px 9px" }} onClick={() => setDay(localDateStr())}>Today</button>
+          )}
+        </div>
+      </div>
+
+      {loading ? (
+        <div style={{ padding: "18px 8px", textAlign: "center" }}><Spinner size={18} /></div>
+      ) : rows.length === 0 ? (
+        <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "4px 8px" }}>
+          Nothing scheduled or logged by anyone on {shortDate(day)}.
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column" }}>
+          {rows.map((item, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+              <div style={{ paddingTop: 8, flexShrink: 0 }} title={item.person?.name}>
+                <Avatar member={item.person} size={22} />
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <AgendaOwnerContext.Provider value={item.person?.id || null}>
+                  <AgendaRow item={item} onOpen={onOpen} onOpenActivity={onOpenActivity} />
+                </AgendaOwnerContext.Provider>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// The dashboard's two-column split, stored as the Team column's share of the
+// width so it holds up across window sizes and screens. Same idea as the
+// sidebar width, different unit.
+const TEAM_COLUMN_PCT_KEY = "edmo.dashboard.teamPct";
+const TEAM_COLUMN_DEFAULT_PCT = 53;
+const TEAM_COLUMN_MIN_PCT = 28;
+const TEAM_COLUMN_MAX_PCT = 72;
+const clampTeamPct = (p) =>
+  Math.min(TEAM_COLUMN_MAX_PCT, Math.max(TEAM_COLUMN_MIN_PCT, Math.round(p * 10) / 10));
+
+const DashboardView = ({ workspaceId, tasks, users, currentUser, onOpen, hasProject, onCreateProject, onAssignTask, projects }) => {
+  const [newProjectName, setNewProjectName] = useState("");
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [myLogs, setMyLogs] = useState([]);
+  const [teamLogs, setTeamLogs] = useState([]); // wide range: last 30 days through today
+  const [logsLoading, setLogsLoading] = useState(true);
+  const [teamTab, setTeamTab] = useState("today");
+  // The dashboard split, dragged like a spreadsheet column: one number, the
+  // Team column's share of the row, with "mine" taking the remainder. Storing
+  // a percentage rather than pixels means the split survives a window resize
+  // and a different monitor. Clamped so neither column can be dragged away.
+  const [teamPct, setTeamPct] = useState(() => {
+    try {
+      const stored = parseFloat(localStorage.getItem(TEAM_COLUMN_PCT_KEY));
+      return Number.isFinite(stored) ? clampTeamPct(stored) : TEAM_COLUMN_DEFAULT_PCT;
+    } catch { return TEAM_COLUMN_DEFAULT_PCT; }
+  });
+  const [columnResizing, setColumnResizing] = useState(false);
+  const columnsRef = useRef(null);
+
+  const setTeamPctPersisted = (next) => {
+    const pct = clampTeamPct(next);
+    setTeamPct(pct);
+    try { localStorage.setItem(TEAM_COLUMN_PCT_KEY, String(pct)); } catch { /* private mode — in-memory only */ }
+  };
+
+  // The pointer's x is turned into "how much of the row is to its RIGHT",
+  // because that is the Team column. Measuring the container every move keeps
+  // it correct if the window is resized mid-drag.
+  const pctFromEvent = (ev) => {
+    const box = columnsRef.current?.getBoundingClientRect();
+    if (!box || box.width === 0) return teamPct;
+    return ((box.right - ev.clientX) / box.width) * 100;
+  };
+
+  const startColumnResize = (e) => {
+    e.preventDefault();
+    setColumnResizing(true);
+    const onMove = (ev) => setTeamPct(clampTeamPct(pctFromEvent(ev)));
+    const onUp = (ev) => {
+      setColumnResizing(false);
+      setTeamPctPersisted(pctFromEvent(ev));
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.classList.remove("tfh-resizing");
+    };
+    document.body.classList.add("tfh-resizing");
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  const [myView, setMyView] = useState("today");
+  // "All Teams Collabs" is a mode of the Team Collabs column, not a fifth
+  // per-member tab — it replaces the per-person blocks with one merged day
+  // view, and keeps its own chosen day.
+  const [allTeamsDay, setAllTeamsDay] = useState(localDateStr());
+  const [activityDetail, setActivityDetail] = useState(null);
+
+  // Who you want at the top of Team Collabs is a personal arrangement of
+  // your own dashboard, not a fact about the workspace — so it's stored per
+  // browser rather than shared, and needs no schema change or permission
+  // rules about who may reorder whom. Stored per workspace, since the
+  // people differ.
+  const memberOrderKey = `edmo.teamOrder.${workspaceId}`;
+  const [memberOrder, setMemberOrder] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(memberOrderKey) || "[]"); } catch { return []; }
+  });
+  const [dragMemberId, setDragMemberId] = useState(null);
+
+  useEffect(() => {
+    try { setMemberOrder(JSON.parse(localStorage.getItem(`edmo.teamOrder.${workspaceId}`) || "[]")); } catch { setMemberOrder([]); }
+  }, [workspaceId]);
+
+  const persistMemberOrder = (ids) => {
+    setMemberOrder(ids);
+    try { localStorage.setItem(memberOrderKey, JSON.stringify(ids)); } catch { /* private mode — in-memory only */ }
+  };
+  const allTeamsOpen = teamTab === "all";
+
+  useEffect(() => {
+    let cancelled = false;
+    setLogsLoading(true);
+    const todayStr = localDateStr();
+    const rangeStart = localDateStr(new Date(Date.now() - 30 * 86400000));
+    Promise.all([api.getMyActivityLogs(workspaceId), api.getTeamActivityLogs(workspaceId, rangeStart, todayStr)])
+      .then(([mine, team]) => {
+        if (cancelled) return;
+        setMyLogs(mine.logs);
+        setTeamLogs(team.logs);
+      })
+      .finally(() => { if (!cancelled) setLogsLoading(false); });
+    return () => { cancelled = true; };
+  }, [workspaceId]);
+
+  const submitNewProject = async (e) => {
+    e.preventDefault();
+    if (!newProjectName.trim()) return;
+    setCreatingProject(true);
+    try {
+      await onCreateProject(newProjectName.trim());
+      setNewProjectName("");
+    } finally {
+      setCreatingProject(false);
+    }
+  };
+
+  const todayStr = localDateStr();
+
+  const myTasksToday = tasks.filter((t) => isAssignedTo(t, currentUser?.id) && t.due === todayStr);
+  // NOT capped. It used to take the first 6, which silently hid anything
+  // further out — an activity added for the 24th simply never appeared, and
+  // looked like it hadn't saved. The card scrolls instead.
+  const myUpcoming = [...tasks]
+    .filter((t) => isAssignedTo(t, currentUser?.id) && t.status !== "done" && t.due && t.due > todayStr)
+    .sort((a, b) => new Date(a.due) - new Date(b.due));
+  // "Pending works" — my tasks that are past due but still not done. These
+  // are the things that have slipped and need catching up on, distinct from
+  // "upcoming" (future) and "today".
+  const myPending = [...tasks]
+    .filter((t) => isAssignedTo(t, currentUser?.id) && t.status !== "done" && t.due && t.due < todayStr)
+    .sort((a, b) => new Date(b.due) - new Date(a.due));
+  const myTodayEntry = myLogs.find((l) => l.entryDate === todayStr);
+  const myAgenda = mergeAgenda(myTasksToday, myTodayEntry, currentUser);
+
+  // Everything I've finished, newest first — the "Complete" tab. Unlike
+  // "Past" this is tasks only and includes ones completed today, which is
+  // what the old Complete button showed on the Board.
+  const myComplete = [...tasks]
+    .filter((t) => isAssignedTo(t, currentUser?.id) && t.status === "done" && t.due)
+    .sort((a, b) => new Date(b.due) - new Date(a.due))
+    .slice(0, 50);
+
+  // Past activities: my completed tasks + my logged activity from before
+  // today, newest first — the diary view.
+  const myPastItems = buildPastItems(
+    [...tasks].filter((t) => isAssignedTo(t, currentUser?.id) && t.status === "done" && t.due && t.due < todayStr).sort((a, b) => new Date(b.due) - new Date(a.due)).slice(0, 15),
+    myLogs.filter((l) => l.entryDate < todayStr),
+    currentUser
+  ).slice(0, 20);
+
+  const isManager = currentUser?.role === "admin" || currentUser?.role === "lead";
+
+  // The top card's list follows whichever view is selected in its header.
+  let myItems = [];
+  let myEmptyText = "Nothing here.";
+  if (myView === "past") {
+    myItems = myPastItems;
+    myEmptyText = "Nothing in the past 30 days.";
+  } else if (myView === "complete") {
+    myItems = buildUpcomingItems(myComplete, "var(--stage-done)");
+    myEmptyText = "Nothing completed yet.";
+  } else if (myView === "pending") {
+    myItems = buildUpcomingItems(myPending);
+    myEmptyText = "Nothing overdue — you're all caught up.";
+  } else {
+    myItems = myAgenda;
+    myEmptyText = "Nothing scheduled or logged for today yet.";
+  }
+  const myViewTitle = MY_VIEWS.find((v) => v.id === myView)?.title || "My Collabs";
+
+  const mineColumn = (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18, flex: `1 1 ${100 - teamPct}%`, minWidth: 0 }}>
+      <div className="tfh-card" style={{ padding: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 12.5, fontWeight: 700 }}>{myViewTitle}</span>
+          {/* Was two buttons that jumped to the Board pre-filtered. Same
+              two concepts, but they now swap this card's list in place —
+              the dashboard is where you were, so it's where you stay. */}
+          <div style={{ display: "flex", gap: 3, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 9, padding: 3, flexWrap: "wrap" }}>
+            {MY_VIEWS.map((v) => {
+              const active = myView === v.id;
+              // Overdue count rides on the Pending pill — the one number
+              // worth seeing without switching to it.
+              const badge = v.id === "pending" && myPending.length > 0 ? myPending.length : null;
+              return (
+                <button
+                  key={v.id} onClick={() => setMyView(v.id)}
+                  className="tfh-btn tfh-btn-ghost"
+                  style={{ fontSize: 11, padding: "3px 9px", background: active ? "var(--accent-soft)" : "transparent", color: active ? "var(--accent)" : "var(--text-dim)" }}
+                  aria-pressed={active}
+                >
+                  {v.label}
+                  {badge && <span style={{ marginLeft: 4, fontSize: 10.5, fontWeight: 800, color: "var(--pri-high)" }}>{badge}</span>}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        {myItems.length === 0 ? (
+          <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "4px 8px" }}>{myEmptyText}</div>
+        ) : (
+          <div className="tfh-fade-in">
+            <GroupedAgenda items={myItems} onOpen={onOpen} onOpenActivity={setActivityDetail} />
+          </div>
+        )}
+      </div>
+
+      <div className="tfh-card" style={{ padding: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={{ fontSize: 12.5, fontWeight: 700 }}>Upcoming Collabs</span>
+          {myUpcoming.length > 0 && (
+            <span className="tfh-chip" style={{ fontSize: 10, background: "var(--raised)", color: "var(--text-dim)" }}>{myUpcoming.length}</span>
+          )}
+        </div>
+        {myUpcoming.length === 0 ? (
+          <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "4px 8px" }}>Nothing upcoming.</div>
+        ) : (
+          // Grouped, so a day with four activities shows its date once
+          // rather than four times down the left edge.
+          <div style={{ maxHeight: 360, overflowY: "auto" }}>
+            <GroupedAgenda items={buildUpcomingItems(myUpcoming)} onOpen={onOpen} />
+          </div>
+        )}
+      </div>
+
+      <div className="tfh-card" style={{ padding: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={{ fontSize: 12.5, fontWeight: 700 }}>Pending Collabs</span>
+          {myPending.length > 0 && <span className="tfh-chip" style={{ fontSize: 10, background: "var(--pri-high)", color: "#fff" }}>{myPending.length}</span>}
+        </div>
+        {myPending.length === 0 ? (
+          <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "4px 8px" }}>Nothing overdue — you're all caught up.</div>
+        ) : (
+          <GroupedAgenda items={buildUpcomingItems(myPending)} onOpen={onOpen} />
+        )}
+      </div>
+    </div>
+  );
+
+  // Saved order first, then anyone it doesn't mention (a new joiner) at the
+  // end — so adding a member never scrambles an arrangement, and a member
+  // who has left simply drops out.
+  const teamMembers = users.filter((u) => u.id !== currentUser?.id);
+  const orderedTeam = [
+    ...memberOrder.map((id) => teamMembers.find((u) => u.id === id)).filter(Boolean),
+    ...teamMembers.filter((u) => !memberOrder.includes(u.id)),
+  ];
+
+  // Whichever tab is active decides what each team member's block shows —
+  // same three concepts as the "All projects" style selector, applied to
+  // the team's activity instead: what's already happened, what's happening
+  // today, and what's coming up. Tasks and activity-log entries are merged
+  // together in every tab, not shown as two separate lists.
+  const teamColumn = (
+    <div className="tfh-team-column" style={{ flex: `1 1 ${teamPct}%`, minWidth: 0, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 13, fontWeight: 700 }}>Team Collabs</span>
+        <div style={{ display: "flex", gap: 4, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 9, padding: 3, flexWrap: "wrap" }}>
+          {/* Sits with the tabs because it IS a mode of this column, but
+              styled as a distinct control — it swaps the per-person blocks
+              for one merged day, rather than re-filtering them. */}
+          <button
+            onClick={() => setTeamTab(allTeamsOpen ? "today" : "all")}
+            className="tfh-btn tfh-btn-ghost"
+            style={{ fontSize: 11.5, padding: "4px 10px", fontWeight: 600, background: allTeamsOpen ? "var(--accent)" : "transparent", color: allTeamsOpen ? "var(--accent-ink)" : "var(--text-dim)" }}
+            title="Everything the whole team did on one day"
+            aria-pressed={allTeamsOpen}
+          >
+            <CalendarRange size={12} /> All Teams Collabs Today
+          </button>
+          {TEAM_TABS.map((t) => (
+            <button
+              key={t.id} onClick={() => setTeamTab(t.id)}
+              className="tfh-btn tfh-btn-ghost"
+              style={{ fontSize: 11.5, padding: "4px 10px", background: teamTab === t.id ? "var(--accent-soft)" : "transparent", color: teamTab === t.id ? "var(--accent)" : "var(--text-dim)" }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {allTeamsOpen && (
+        <AllTeamsCollabsPanel
+          workspaceId={workspaceId} day={allTeamsDay} setDay={setAllTeamsDay}
+          tasks={tasks} users={users} currentUser={currentUser}
+          onOpen={onOpen} onOpenActivity={setActivityDetail}
+        />
+      )}
+
+      {!allTeamsOpen && orderedTeam.map((u) => {
+        let items = [];
+        let emptyText = "Nothing here.";
+        if (teamTab === "today") {
+          const theirTasksToday = tasks.filter((t) => isAssignedTo(t, u.id) && t.due === todayStr);
+          const theirEntry = teamLogs.find((l) => l.userId === u.id && l.entryDate === todayStr);
+          items = mergeAgenda(theirTasksToday, theirEntry, u);
+          emptyText = "Nothing today.";
+        } else if (teamTab === "upcoming") {
+          const theirUpcoming = [...tasks]
+            .filter((t) => isAssignedTo(t, u.id) && t.status !== "done" && t.due && t.due > todayStr)
+            .sort((a, b) => new Date(a.due) - new Date(b.due));
+          items = buildUpcomingItems(theirUpcoming);
+          emptyText = "Nothing upcoming.";
+        } else if (teamTab === "pending") {
+          // Pending = this member's overdue-but-not-done tasks, most overdue
+          // first. Shown here so a supervisor can see who's behind at a glance.
+          const theirPending = [...tasks]
+            .filter((t) => isAssignedTo(t, u.id) && t.status !== "done" && t.due && t.due < todayStr)
+            .sort((a, b) => new Date(a.due) - new Date(b.due));
+          items = buildUpcomingItems(theirPending);
+          emptyText = "Nothing pending — all caught up.";
+        } else {
+          const theirPastTasks = tasks
+            .filter((t) => isAssignedTo(t, u.id) && t.status === "done" && t.due && t.due < todayStr)
+            .sort((a, b) => new Date(b.due) - new Date(a.due))
+            .slice(0, 8);
+          const theirPastLogs = teamLogs.filter((l) => l.userId === u.id && l.entryDate < todayStr);
+          items = buildPastItems(theirPastTasks, theirPastLogs, u).slice(0, 10);
+          emptyText = "Nothing in the past 30 days.";
+        }
+        if (items.length === 0 && logsLoading) return null; // avoid a flash of empty state while still loading
+        return (
+          <TeamMemberAgenda
+            key={u.id} member={u} items={items} onOpen={onOpen} onOpenActivity={setActivityDetail}
+            emptyText={emptyText} onAssignTask={onAssignTask}
+            dragging={dragMemberId === u.id}
+            dragProps={{
+              draggable: true,
+              onDragStart: () => setDragMemberId(u.id),
+              onDragOver: (e) => {
+                e.preventDefault();
+                if (!dragMemberId || dragMemberId === u.id) return;
+                const base = orderedTeam.map((m) => m.id);
+                const from = base.indexOf(dragMemberId);
+                const to = base.indexOf(u.id);
+                if (from === -1 || to === -1) return;
+                const next = [...base];
+                next.splice(from, 1);
+                next.splice(to, 0, dragMemberId);
+                persistMemberOrder(next);
+              },
+              onDragEnd: () => setDragMemberId(null),
+              onDrop: (e) => { e.preventDefault(); setDragMemberId(null); },
+            }}
+          />
+        );
+      })}
+      {!allTeamsOpen && !logsLoading && teamMembers.length === 0 && (
+        <div className="tfh-card" style={{ padding: 18, textAlign: "center" }}>
+          <div style={{ fontSize: 12, color: "var(--text-faint)" }}>No other team members yet.</div>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <AgendaOwnerContext.Provider value={currentUser?.id || null}>
+    <div className="tfh-fade-in" style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+      <div>
+        <div className="tfh-display" style={{ fontSize: 26, fontWeight: 600, marginBottom: 4 }}>{BRAND.dashboardTitle}</div>
+        <div style={{ fontSize: 13.5, color: "var(--text-dim)" }}>{new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
+      </div>
+
+      {!hasProject && (
+        <div className="tfh-card" style={{ padding: 20, borderColor: "var(--accent)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+            <FolderKanban size={16} color="var(--accent)" />
+            <span style={{ fontSize: 13.5, fontWeight: 700 }}>No project yet</span>
+          </div>
+          <div style={{ fontSize: 12.5, color: "var(--text-dim)", marginBottom: isManager ? 14 : 0, lineHeight: 1.5 }}>
+            {isManager
+              ? "This workspace doesn't have a project yet — create one to start adding tasks. Everything below will fill in once you do."
+              : "This workspace doesn't have a project yet. Check back once your admin or lead sets one up."}
+          </div>
+          {isManager && (
+            <form onSubmit={submitNewProject} style={{ display: "flex", gap: 8, maxWidth: 380 }}>
+              <input className="tfh-input" placeholder="Name your first project" value={newProjectName} onChange={(e) => setNewProjectName(e.target.value)} />
+              <button className="tfh-btn tfh-btn-accent" disabled={creatingProject || !newProjectName.trim()} style={{ flexShrink: 0 }}>
+                <Plus size={14} /> {creatingProject ? "Creating…" : "Create"}
+              </button>
+            </form>
+          )}
+        </div>
+      )}
+
+      {/* Mine on the left (with totals nested underneath it), team on the
+          right — reverses on mobile so mine reads first, matching the
+          same top-to-bottom order as the desktop left-to-right layout. */}
+      <div className="tfh-dashboard-columns" ref={columnsRef}>
+        {mineColumn}
+        {/* Drag to move the split between the two columns. Same affordances
+            as the sidebar handle: double-click resets, arrow keys nudge it
+            for anyone without a pointer. */}
+        <div
+          className={`tfh-column-resizer ${columnResizing ? "active" : ""}`}
+          onMouseDown={startColumnResize}
+          onDoubleClick={() => setTeamPctPersisted(TEAM_COLUMN_DEFAULT_PCT)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") { e.preventDefault(); setTeamPctPersisted(teamPct + 3); }
+            if (e.key === "ArrowRight") { e.preventDefault(); setTeamPctPersisted(teamPct - 3); }
+          }}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize the Team Collabs column"
+          tabIndex={0}
+          title="Drag to resize · double-click to reset"
+        />
+        {teamColumn}
+      </div>
+
+      {activityDetail && (
+        <ActivityDetailModal
+          item={activityDetail}
+          projects={projects}
+          currentUserId={currentUser?.id}
+          onClose={() => setActivityDetail(null)}
+          onSetStatus={async (hit, next) => {
+            const { log } = await api.setActivityBlockStatus(workspaceId, hit.entryDate, hit.blockIndex, next);
+            const merge = (rows) => rows.map((l) => (l.id === log.id ? { ...l, content: log.content } : l));
+            setMyLogs(merge);
+            setTeamLogs(merge);
+          }}
+        />
+      )}
+    </div>
+    </AgendaOwnerContext.Provider>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Board view                                                            */
+/* ------------------------------------------------------------------ */
+// Compact, inline "create a project" control — sits right next to the
+// project filter on the Board, since that's the one remaining place "All
+// projects" lives as a concept once the sidebar's own project list was
+// removed. Toggle button reveals a small form in place, no separate modal.
+const NewProjectButton = ({ onCreateProject }) => {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [deadline, setDeadline] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  const close = () => { setOpen(false); setName(""); setDescription(""); setDeadline(""); };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setCreating(true);
+    try {
+      await onCreateProject(name.trim(), description.trim(), deadline || null);
+      close();
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <>
+      <button className="tfh-btn tfh-btn-ghost" onClick={() => setOpen(true)} style={{ width: "100%", justifyContent: "flex-start" }}>
+        <Plus size={14} /> New project
+      </button>
+
+      {open && (
+        <div className="tfh-modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) close(); }}>
+          <form onSubmit={submit} className="tfh-card tfh-modal-card" style={{ width: "100%", maxWidth: 420, padding: 22 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <span className="tfh-display" style={{ fontSize: 19, fontWeight: 600 }}>New project</span>
+              <button type="button" className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={close} aria-label="Close"><X size={16} /></button>
+            </div>
+
+            <label className="tfh-label" htmlFor="np-name">Project name</label>
+            <input
+              id="np-name" autoFocus className="tfh-input" style={{ marginBottom: 14 }} placeholder="e.g. Q4 Export Readiness"
+              value={name} onChange={(e) => setName(e.target.value)}
+            />
+
+            <label className="tfh-label" htmlFor="np-desc">Description <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(optional)</span></label>
+            <textarea
+              id="np-desc" className="tfh-input" rows={3} style={{ resize: "vertical", marginBottom: 14 }} placeholder="What's this project about?"
+              value={description} onChange={(e) => setDescription(e.target.value)}
+            />
+
+            <label className="tfh-label" htmlFor="np-deadline">Deadline <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(optional)</span></label>
+            <DateField id="np-deadline" style={{ marginBottom: 20 }} value={deadline} onChange={setDeadline} ariaLabel="Project deadline" />
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, borderTop: "1px solid var(--line)", paddingTop: 16 }}>
+              <button type="button" className="tfh-btn" onClick={close} disabled={creating}>Cancel</button>
+              <button className="tfh-btn tfh-btn-accent" disabled={creating || !name.trim()}>{creating ? "Creating…" : "Create project"}</button>
+            </div>
+          </form>
+        </div>
+      )}
+    </>
+  );
+};
+
+const BoardView = ({ tasks, users, projects, onOpen, onComplete, onReopen, onAdd, onBulkAdd, onCreateProject, search, setSearch, priorityFilter, setPriorityFilter, assigneeFilter, setAssigneeFilter, statusFilter, setStatusFilter, projectFilter, setProjectFilter, canManage, currentUserId, workspaceId, onOpenFiles }) => {
+  // A real project id — not "all", not a stale id for a project that's been
+  // deleted since.
+  const showFiles = projectFilter && projectFilter !== "all" && projects.some((p) => p.id === projectFilter);
+  const filtered = tasks
+    .filter((t) => {
+      if (search && !t.title.toLowerCase().includes(search.toLowerCase())) return false;
+      if (priorityFilter === "urgent" && !isUrgent(t.priority)) return false;
+      if (assigneeFilter !== "all" && t.assigneeId !== assigneeFilter) return false;
+      if (projectFilter !== "all" && t.projectId !== projectFilter) return false;
+      if (statusFilter === "active" && t.status !== "todo") return false;
+      if (statusFilter === "shipped" && t.status !== "done") return false;
+      if (statusFilter === "overdue" && !(t.status !== "done" && dueMeta(t.due, t.status).label.includes("overdue"))) return false;
+      return true;
+    })
+    // Sorted so the LATEST time sits at the top of the column and the
+    // earliest at the bottom (per explicit request: "early time bottom,
+    // late time on top"). Tasks with no date/time sort to the very bottom.
+    .sort((a, b) => `${b.due || "0000"} ${b.dueTime || "00:00"}`.localeCompare(`${a.due || "0000"} ${a.dueTime || "00:00"}`));
+
+  const STATUS_QUICK_FILTERS = [
+    { id: "all", label: "All" },
+    { id: "active", label: "Active" },
+    { id: "shipped", label: "Shipped" },
+    { id: "overdue", label: "Overdue" },
+  ];
+
+  // Once you've filtered down to a single project, tagging every card with
+  // that same project again is just noise — the badge earns its place only
+  // when the board is showing more than one project at a time.
+  const showProject = projectFilter === "all";
+  const hasProjects = projects.length > 0;
+
+  return (
+    <div className="tfh-fade-in" style={{ display: "flex", flexDirection: "column", gap: 16, height: "100%" }}>
+      {statusFilter !== "all" && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: "var(--accent)", background: "var(--accent-soft)", padding: "8px 12px", borderRadius: 10, width: "fit-content" }}>
+          Showing: {STATUS_QUICK_FILTERS.find((f) => f.id === statusFilter)?.label}
+          <button onClick={() => setStatusFilter("all")} className="tfh-btn tfh-btn-ghost" style={{ padding: 2 }} aria-label="Clear filter"><X size={12} /></button>
+        </div>
+      )}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+        <div style={{ position: "relative", flex: "1 1 220px", maxWidth: 320 }}>
+          <Search size={14} color="var(--text-faint)" style={{ position: "absolute", left: 11, top: 10 }} />
+          <input className="tfh-input" style={{ paddingLeft: 32 }} placeholder="Search tasks" value={search} onChange={(e) => setSearch(e.target.value)} />
+        </div>
+        <select className="tfh-input" style={{ width: "auto" }} value={projectFilter} onChange={(e) => setProjectFilter(e.target.value)}>
+          <option value="all">All projects</option>
+          {projects.filter((p) => !p.completedAt).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          {projects.some((p) => p.completedAt) && (
+            <optgroup label="Completed Projects">
+              {projects.filter((p) => p.completedAt).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </optgroup>
+          )}
+        </select>
+        <NewProjectButton onCreateProject={onCreateProject} />
+        <select className="tfh-input" style={{ width: "auto" }} value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}>
+          <option value="all">All tasks</option>
+          <option value="urgent">Urgent only</option>
+        </select>
+        <select className="tfh-input" style={{ width: "auto" }} value={assigneeFilter} onChange={(e) => setAssigneeFilter(e.target.value)}>
+          <option value="all">Everyone</option>
+          {users.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+        </select>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          {canManage && hasProjects && <button className="tfh-btn tfh-btn-ghost" onClick={onBulkAdd}><ClipboardList size={14} /> Bulk add</button>}
+          {hasProjects ? (
+            <button className="tfh-btn tfh-btn-accent" onClick={() => onAdd("todo")}><Plus size={14} /> New task</button>
+          ) : (
+            <span style={{ fontSize: 12, color: "var(--text-faint)" }}>Create a project first to add tasks.</span>
+          )}
+        </div>
+      </div>
+
+      {/* The files column only appears when ONE project is selected — with
+          "All projects" there's no single set of files to show. It's a
+          sibling column of the stages so the board still reads as one grid. */}
+      <div
+        className="tfh-board-grid"
+        style={{
+          display: "grid",
+          gridTemplateColumns: showFiles ? `repeat(${STAGES.length}, minmax(0,1fr)) minmax(220px, 0.8fr)` : `repeat(${STAGES.length}, minmax(0,1fr))`,
+          gap: 14, flex: 1, overflowX: "auto", paddingBottom: 4,
+          maxWidth: STAGES.length <= 2 ? (showFiles ? 1040 : 720) : "none",
+        }}
+      >
+        {STAGES.map((stage) => (
+          <Column
+            key={stage.id} stage={stage} users={users} canManage={canManage} canCreate={hasProjects} currentUserId={currentUserId} showProject={showProject}
+            tasks={filtered.filter((t) => t.status === stage.id)}
+            onOpen={onOpen} onAdd={onAdd} onComplete={onComplete} onReopen={onReopen}
+          />
+        ))}
+        {showFiles && (
+          <BoardFilesPanel
+            workspaceId={workspaceId} projectId={projectFilter}
+            projectName={projects.find((p) => p.id === projectFilter)?.name}
+            onOpenFiles={onOpenFiles}
+          />
+        )}
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Team view                                                             */
+/* ------------------------------------------------------------------ */
+const ROLE_LABEL = { admin: "Admin", lead: "Lead", member: "Member" };
+const ROLE_BADGE_STYLE = {
+  admin: { background: "var(--stage-done)22", color: "var(--stage-done)", borderColor: "var(--stage-done)40" },
+  lead: { background: "var(--accent-soft)", color: "var(--accent)", borderColor: "var(--accent)40" },
+  member: { background: "var(--raised)", color: "var(--text-dim)", borderColor: "var(--line)" },
+};
+const RoleBadge = ({ role }) => (
+  <span className="tfh-chip" style={ROLE_BADGE_STYLE[role] || ROLE_BADGE_STYLE.member}>
+    {role === "admin" && <Shield size={11} />}
+    {role === "lead" && <BadgeCheck size={11} />}
+    {ROLE_LABEL[role] || role}
+  </span>
+);
+
+const RemoveMemberButton = ({ onConfirm }) => {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => { if (!armed) return; const t = setTimeout(() => setArmed(false), 2500); return () => clearTimeout(t); }, [armed]);
+  return armed ? (
+    <button className="tfh-btn tfh-btn-danger" style={{ width: "100%", fontSize: 12, marginTop: 8 }} onClick={onConfirm}>
+      <UserPlus size={12} style={{ transform: "rotate(45deg)" }} /> Click to confirm removal
+    </button>
+  ) : (
+    <button className="tfh-btn tfh-btn-ghost" style={{ width: "100%", fontSize: 12, marginTop: 8, color: "var(--pri-high)" }} onClick={() => setArmed(true)}>
+      Remove from team
+    </button>
+  );
+};
+
+const PostEditor = ({ member, canEdit, onSave }) => {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(member.title);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { setValue(member.title); }, [member.title]);
+
+  if (!editing) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ fontSize: 12, color: "var(--text-dim)" }}>{member.title}</span>
+        {canEdit && (
+          <button type="button" onClick={() => setEditing(true)} className="tfh-btn tfh-btn-ghost" style={{ padding: 2 }} aria-label="Edit post/designation">
+            <Pencil size={11} color="var(--text-faint)" />
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  const save = async () => {
+    if (!value.trim()) return;
+    setBusy(true);
+    try {
+      await onSave(value.trim());
+      setEditing(false);
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+      <input
+        autoFocus list="post-suggestions" className="tfh-input" style={{ fontSize: 12, padding: "4px 8px" }}
+        value={value} onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") save(); if (e.key === "Escape") setEditing(false); }}
+      />
+      <button type="button" onClick={save} disabled={busy} className="tfh-btn tfh-btn-ghost" style={{ padding: 4, flexShrink: 0 }} aria-label="Save"><Check size={12} color="var(--stage-done)" /></button>
+      <button type="button" onClick={() => setEditing(false)} className="tfh-btn tfh-btn-ghost" style={{ padding: 4, flexShrink: 0 }} aria-label="Cancel"><X size={12} color="var(--text-faint)" /></button>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Work report — the whole team's record, or one person's, as a Word    */
+/* document on the letterhead.                                          */
+/* ------------------------------------------------------------------ */
+// Everything is assembled server-side: the document has to carry every
+// comment, file, subtask and logged activity, and the browser only holds
+// what the current page happens to have fetched. Building it here would
+// quietly produce a report with things missing, which is worse than none.
+const ReportPanel = ({ workspaceId, users, projects, currentUser, canManage }) => {
+  // A plain member can only pull their own record, which the server enforces
+  // too — so their picker is fixed to themselves rather than showing options
+  // that would come back 403.
+  const [who, setWho] = useState(canManage ? "all" : currentUser.id);
+  const [scopeProject, setScopeProject] = useState("all");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [done, setDone] = useState("");
+
+  const download = async () => {
+    setBusy(true); setError(""); setDone("");
+    try {
+      const { blob, fileName } = await api.downloadTeamReport(workspaceId, {
+        userId: who === "all" ? undefined : who,
+        projectId: scopeProject === "all" ? undefined : scopeProject,
+        from: from || undefined,
+        to: to || undefined,
+      });
+      setDone(saveReportBlob({ blob, fileName }));
+    } catch (err) {
+      setError(err.message || "Couldn't build the report.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="tfh-card" style={{ padding: 18 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <FileText size={15} color="var(--accent)" />
+        <span style={{ fontSize: 13.5, fontWeight: 700 }}>Work report (Word)</span>
+      </div>
+      <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 14, lineHeight: 1.5 }}>
+        A full record on {BRAND.shortName} letterhead, project by project: every activity with its dates, times,
+        status, description, meeting notes, comments, files and links — plus each person's
+        logged activities. Leave the dates empty for everything on record.
+      </div>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div style={{ minWidth: 190 }}>
+          <label className="tfh-label" htmlFor="tfh-report-who">Who</label>
+          <select id="tfh-report-who" className="tfh-input" style={{ fontSize: 12.5 }} value={who} onChange={(e) => setWho(e.target.value)} disabled={!canManage}>
+            {canManage && <option value="all">All team members</option>}
+            {(canManage ? users : users.filter((u) => u.id === currentUser.id)).map((u) => (
+              <option key={u.id} value={u.id}>{u.name}</option>
+            ))}
+          </select>
+        </div>
+        <div style={{ minWidth: 190 }}>
+          <label className="tfh-label" htmlFor="tfh-report-project">Project</label>
+          <select id="tfh-report-project" className="tfh-input" style={{ fontSize: 12.5 }} value={scopeProject} onChange={(e) => setScopeProject(e.target.value)}>
+            <option value="all">All projects</option>
+            {(projects || []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
+        <div style={{ minWidth: 150 }}>
+          <label className="tfh-label">From (optional)</label>
+          <DateField value={from} onChange={setFrom} />
+        </div>
+        <div style={{ minWidth: 150 }}>
+          <label className="tfh-label">To (optional)</label>
+          <DateField value={to} onChange={setTo} />
+        </div>
+        <button className="tfh-btn tfh-btn-accent" onClick={download} disabled={busy} style={{ flexShrink: 0 }}>
+          <Download size={14} /> {busy ? "Building…" : "Download report"}
+        </button>
+      </div>
+      {error && <div style={{ fontSize: 12, color: "var(--pri-high)", marginTop: 10 }}>{error}</div>}
+      {done && <div style={{ fontSize: 12, color: "var(--stage-done)", marginTop: 10 }}>Saved {done}</div>}
+    </div>
+  );
+};
+
+// Saves a report the server built. Shared by the team and project reports.
+const saveReportBlob = ({ blob, fileName }) => {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = fileName;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  return fileName;
+};
+
+/**
+ * Project report — one project, everything that happened on it, in date
+ * order (a project diary), on the letterhead. Offered to the admin, team
+ * leads and each project's own lead (the server enforces the same rule); a
+ * project lead only sees the projects they lead.
+ */
+const ProjectReportPanel = ({ workspaceId, projects, currentUser, canManage, initialProjectId }) => {
+  const reportable = (projects || []).filter((p) => canManage || p.leadId === currentUser.id);
+  const sorted = [
+    ...reportable.filter((p) => !p.completedAt).sort((a, b) => a.name.localeCompare(b.name)),
+    ...reportable.filter((p) => p.completedAt).sort((a, b) => a.name.localeCompare(b.name)),
+  ];
+  const [projectId, setProjectId] = useState(() => (sorted.some((p) => p.id === initialProjectId) ? initialProjectId : ""));
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [done, setDone] = useState("");
+
+  if (!sorted.length) return null;
+
+  const download = async () => {
+    if (!projectId) { setError("Choose the project first."); return; }
+    if (from && to && from > to) { setError("The From date must be on or before the To date."); return; }
+    setBusy(true); setError(""); setDone("");
+    try {
+      setDone(saveReportBlob(await api.downloadProjectReport(workspaceId, { projectId, from: from || undefined, to: to || undefined })));
+    } catch (err) {
+      setError(err.message || "Couldn't build the project report.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const active = sorted.filter((p) => !p.completedAt);
+  const finished = sorted.filter((p) => p.completedAt);
+
+  return (
+    <div className="tfh-card" style={{ padding: 18 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <FolderKanban size={15} color="var(--accent)" />
+        <span style={{ fontSize: 13.5, fontWeight: 700 }}>Project report (Word)</span>
+      </div>
+      <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 14, lineHeight: 1.5 }}>
+        Everything that happened on one project, in date order: a timeline, then every activity in full —
+        who did it, when, status, how late, notes, comments, files and links — plus milestones and
+        day-book entries tagged to the project. Leave the dates empty for the whole history.
+      </div>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div style={{ minWidth: 240, flex: "1 1 240px", maxWidth: 360 }}>
+          <label className="tfh-label" htmlFor="tfh-project-report-project">Project</label>
+          <select
+            id="tfh-project-report-project" className="tfh-input" style={{ fontSize: 12.5 }}
+            value={projectId} onChange={(e) => { setProjectId(e.target.value); setError(""); }}
+          >
+            <option value="" disabled>Choose a project…</option>
+            {active.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {finished.length > 0 && (
+              <optgroup label="Completed Projects">
+                {finished.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </optgroup>
+            )}
+          </select>
+        </div>
+        <div style={{ minWidth: 150 }}>
+          <label className="tfh-label">From (optional)</label>
+          <DateField value={from} onChange={setFrom} ariaLabel="Project report from" />
+        </div>
+        <div style={{ minWidth: 150 }}>
+          <label className="tfh-label">To (optional)</label>
+          <DateField value={to} onChange={setTo} ariaLabel="Project report to" />
+        </div>
+        <button className="tfh-btn tfh-btn-accent" onClick={download} disabled={busy} style={{ flexShrink: 0 }}>
+          <Download size={14} /> {busy ? "Building…" : "Download project report"}
+        </button>
+      </div>
+      {error && <div role="alert" style={{ fontSize: 12, color: "var(--pri-high)", marginTop: 10 }}>{error}</div>}
+      {done && <div style={{ fontSize: 12, color: "var(--stage-done)", marginTop: 10 }}>Saved {done}</div>}
+    </div>
+  );
+};
+
+const TeamView = ({ tasks, users, currentUser, onOpen, onSetRole, onSetTitle, onInvite, onRemoveMember, canManage, workspaceId, projects, onSetProjectLead }) => {
+  const isAdmin = currentUser.role === "admin";
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteStatus, setInviteStatus] = useState(null);
+  const [inviting, setInviting] = useState(false);
+  const [roleBusy, setRoleBusy] = useState(null);
+  const [removeBusy, setRemoveBusy] = useState(null);
+  const [workload, setWorkload] = useState(null);
+  const [workloadLoading, setWorkloadLoading] = useState(true);
+
+  useEffect(() => {
+    if (!canManage || !workspaceId) { setWorkloadLoading(false); return; }
+    let cancelled = false;
+    setWorkloadLoading(true);
+    api.getWorkload(workspaceId)
+      .then((res) => { if (!cancelled) setWorkload(res.workload); })
+      .catch(() => { if (!cancelled) setWorkload(null); })
+      .finally(() => { if (!cancelled) setWorkloadLoading(false); });
+    return () => { cancelled = true; };
+  }, [canManage, workspaceId]);
+
+  // Carry the whole member through, not just the first name — clicking a
+  // bar needs to know WHO it is, and several people here share a first name
+  // (the chart axis alone can't tell "Sonam" from "Sonam").
+  const chartData = (workload || []).map((w) => ({
+    id: w.id,
+    name: w.name.split(" ")[0],
+    fullName: w.name,
+    active: w.active,
+    shipped: w.shipped ?? 0,
+    color: users.find((u) => u.id === w.id)?.color || "var(--accent)",
+  }));
+
+  // Which bar is selected. Clicking the same one again clears it, so the
+  // panel isn't a thing you can open but never close.
+  const [selectedBar, setSelectedBar] = useState(null);
+  const selected = chartData.find((d) => d.id === selectedBar) || null;
+  const selectedTasks = selected
+    ? tasks.filter((t) => isAssignedTo(t, selected.id) && t.status === "done")
+    : [];
+
+  const submitInvite = async (e) => {
+    e.preventDefault();
+    if (!inviteEmail.trim()) return;
+    setInviting(true);
+    setInviteStatus(null);
+    try {
+      const result = await onInvite(inviteEmail.trim());
+      setInviteStatus({ ok: true, text: result.status === "added" ? `${inviteEmail} is on the team now.` : `Invite sent — they'll join automatically when they sign up.` });
+      setInviteEmail("");
+    } catch (err) {
+      setInviteStatus({ ok: false, text: err.message });
+    } finally {
+      setInviting(false);
+    }
+  };
+
+  const changeRole = async (userId, role) => {
+    setRoleBusy(userId);
+    try {
+      await onSetRole(userId, role);
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setRoleBusy(null);
+    }
+  };
+
+  const removeMember = async (userId) => {
+    setRemoveBusy(userId);
+    try {
+      await onRemoveMember(userId);
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setRemoveBusy(null);
+    }
+  };
+
+  return (
+    <div className="tfh-fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <datalist id="post-suggestions">
+        {POST_SUGGESTIONS.map((p) => <option key={p} value={p} />)}
+      </datalist>
+      <div>
+        <div className="tfh-display" style={{ fontSize: 26, fontWeight: 600, marginBottom: 4 }}>The team</div>
+        <div style={{ fontSize: 13.5, color: "var(--text-dim)" }}>
+          Signed in as <strong>{currentUser.name}</strong> · <RoleBadge role={currentUser.role} />
+          {isAdmin ? " — you can assign the team lead, manage roles, and remove members." : " — only the admin can change roles."}
+        </div>
+      </div>
+
+      <ReportPanel
+        workspaceId={workspaceId} users={users} projects={projects}
+        currentUser={currentUser} canManage={canManage}
+      />
+
+      <ProjectReportPanel
+        workspaceId={workspaceId} projects={projects}
+        currentUser={currentUser} canManage={canManage}
+      />
+
+      {(() => {
+        const lead = users.find((m) => m.role === "lead");
+        const admin = users.find((m) => m.role === "admin");
+        return (
+          <div className="tfh-card" style={{ padding: "14px 18px", display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <BadgeCheck size={16} color="var(--accent)" />
+              <div>
+                <div className="tfh-label" style={{ marginBottom: 2 }}>Team Lead</div>
+                {lead ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <Avatar member={lead} size={20} />
+                    <span style={{ fontSize: 13.5, fontWeight: 600 }}>{lead.name}</span>
+                  </div>
+                ) : (
+                  <span style={{ fontSize: 13, color: "var(--text-faint)" }}>Not assigned yet{isAdmin ? " — pick one below" : ""}</span>
+                )}
+              </div>
+            </div>
+            <div style={{ width: 1, alignSelf: "stretch", background: "var(--line)" }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Shield size={16} color="var(--stage-done)" />
+              <div>
+                <div className="tfh-label" style={{ marginBottom: 2 }}>Admin</div>
+                {admin && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <Avatar member={admin} size={20} />
+                    <span style={{ fontSize: 13.5, fontWeight: 600 }}>{admin.name}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {canManage && (
+        <div className="tfh-card" style={{ padding: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10 }}>Invite a teammate</div>
+          <form onSubmit={submitInvite} style={{ display: "flex", gap: 8 }}>
+            <input type="email" className="tfh-input" placeholder="teammate@company.com" value={inviteEmail} onChange={(e) => setInviteEmail(e.target.value)} required />
+            <button className="tfh-btn tfh-btn-accent" disabled={inviting} style={{ flexShrink: 0 }}>
+              <UserPlus size={14} /> {inviting ? "Sending…" : "Invite"}
+            </button>
+          </form>
+          {inviteStatus && (
+            <div style={{ fontSize: 12, marginTop: 10, color: inviteStatus.ok ? "var(--stage-done)" : "var(--pri-high)" }}>{inviteStatus.text}</div>
+          )}
+          <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginTop: 8 }}>
+            New teammates join as <strong>Member</strong> by default — they'll only see tasks assigned to them until you promote them.
+          </div>
+        </div>
+      )}
+
+      {canManage && (
+        <div className="tfh-card" style={{ padding: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 16 }}>Active workload <span style={{ fontWeight: 400, color: "var(--text-faint)" }}>— across every project</span></div>
+          {workloadLoading ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "20px 0", justifyContent: "center" }}><Spinner size={16} /> <span style={{ fontSize: 12, color: "var(--text-dim)" }}>Loading…</span></div>
+          ) : chartData.length === 0 ? (
+            <div style={{ fontSize: 12.5, color: "var(--text-faint)", textAlign: "center", padding: "20px 0" }}>No workload data yet.</div>
+          ) : (
+            <div style={{ width: "100%", height: 180 }}>
+              <ResponsiveContainer>
+                <BarChart data={chartData} margin={{ top: 0, right: 8, left: -20, bottom: 0 }}>
+                  <XAxis dataKey="name" tick={{ fill: "var(--chart-tick)", fontSize: 11 }} axisLine={{ stroke: "var(--chart-grid)" }} tickLine={false} />
+                  <YAxis allowDecimals={false} tick={{ fill: "var(--chart-tick)", fontSize: 11 }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={{ background: "var(--chart-tooltip-bg)", border: "1px solid var(--line)", borderRadius: 8, fontSize: 12 }} cursor={{ fill: "var(--raised)" }} />
+                  <Bar
+                    dataKey="active" radius={[6, 6, 0, 0]}
+                    cursor="pointer"
+                    onClick={(bar) => setSelectedBar((prev) => (prev === bar?.id ? null : bar?.id))}
+                  >
+                    {chartData.map((d, i) => (
+                      <Cell
+                        key={i} fill={d.color}
+                        // Dim the others once something is selected, so the
+                        // chart itself shows what the panel below is about.
+                        fillOpacity={selectedBar && selectedBar !== d.id ? 0.35 : 1}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+          {!workloadLoading && chartData.length > 0 && !selected && (
+            <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginTop: 8 }}>
+              Click a bar to see what that person has completed.
+            </div>
+          )}
+          {selected && (
+            <div className="tfh-fade-in" style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--line)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+                <Avatar member={users.find((u) => u.id === selected.id)} size={22} />
+                <span style={{ fontSize: 13, fontWeight: 700 }}>{selected.fullName}</span>
+                <span className="tfh-chip" style={{ background: "var(--raised)", color: "var(--stage-done)", fontSize: 11 }}>
+                  <CheckCircle2 size={11} /> {selectedTasks.length} completed
+                </span>
+                <span className="tfh-chip" style={{ background: "var(--raised)", color: "var(--text-dim)", fontSize: 11 }}>
+                  {selected.active} active
+                </span>
+                <button className="tfh-btn tfh-btn-ghost" style={{ marginLeft: "auto", fontSize: 11, padding: "3px 8px" }} onClick={() => setSelectedBar(null)}>
+                  <X size={11} /> Clear
+                </button>
+              </div>
+              {selectedTasks.length === 0 ? (
+                <div style={{ fontSize: 12, color: "var(--text-faint)" }}>Nothing completed yet.</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 2, maxHeight: 220, overflowY: "auto" }}>
+                  {[...selectedTasks]
+                    .sort((a, b) => (b.due || "").localeCompare(a.due || ""))
+                    .map((t) => (
+                      <button
+                        key={t.id} onClick={() => onOpen(t)} className="tfh-search-result"
+                        style={{ padding: "6px 8px", gap: 8 }} title={t.title}
+                      >
+                        <CheckCircle2 size={12} color="var(--stage-done)" style={{ flexShrink: 0 }} />
+                        <span style={{ fontSize: 12.5, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.title}</span>
+                        {t.due && <span className="tfh-mono" style={{ fontSize: 10.5, color: "var(--date-scheduled)", flexShrink: 0 }}>{shortDate(t.due)}</span>}
+                      </button>
+                    ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 14 }}>
+        {users.map((m) => {
+          const isMe = currentUser.id === m.id;
+          const showTaskInfo = canManage || isMe;
+          const mine = tasks.filter((t) => isAssignedTo(t, m.id));
+          const active = mine.filter((t) => t.status !== "done");
+          return (
+            <div key={m.id} className="tfh-card" style={{ padding: 16, borderColor: isMe ? "var(--accent)" : "var(--line)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                <Avatar member={m} size={36} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {m.name}{isMe && <span style={{ color: "var(--text-faint)", fontWeight: 500 }}> · you</span>}
+                  </div>
+                  <PostEditor member={m} canEdit={isMe || isAdmin} onSave={(title) => onSetTitle(m.id, title)} />
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 10 }}><RoleBadge role={m.role} /></div>
+
+              {showTaskInfo ? (
+                <>
+                  <div style={{ display: "flex", gap: 14, fontSize: 12, color: "var(--text-dim)", marginBottom: 10 }}>
+                    <span><strong className="tfh-mono" style={{ color: "var(--text)" }}>{active.length}</strong> active</span>
+                    <span><strong className="tfh-mono" style={{ color: "var(--text)" }}>{mine.length - active.length}</strong> shipped</span>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
+                    {active.slice(0, 3).map((t) => (
+                      <button key={t.id} onClick={() => onOpen(t)} style={{ textAlign: "left", background: "var(--raised)", border: "none", color: "var(--text-dim)", fontSize: 12, padding: "6px 8px", borderRadius: 7 }}>{t.title}</button>
+                    ))}
+                    {active.length === 0 && <div style={{ fontSize: 12, color: "var(--text-faint)" }}>Nothing active — fully clear.</div>}
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                  <Lock size={11} /> Only visible to {m.name.split(" ")[0]} and the team lead
+                </div>
+              )}
+
+              {isAdmin && (
+                <select
+                  className="tfh-input" style={{ fontSize: 12 }} value={m.role} disabled={roleBusy === m.id || removeBusy === m.id}
+                  onChange={(e) => changeRole(m.id, e.target.value)}
+                >
+                  <option value="admin">Admin</option>
+                  <option value="lead">Lead</option>
+                  <option value="member">Member</option>
+                </select>
+              )}
+
+              {isAdmin && projects.length > 0 && (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 10.5, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 5 }}>Lead of</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                    {projects.map((p) => {
+                      const isLeadHere = p.leadId === m.id;
+                      return (
+                        <button
+                          key={p.id}
+                          onClick={() => onSetProjectLead(p.id, isLeadHere ? null : m.id)}
+                          className="tfh-chip"
+                          style={{
+                            background: isLeadHere ? "var(--accent-soft)" : "var(--raised)",
+                            color: isLeadHere ? "var(--accent)" : "var(--text-faint)",
+                            border: isLeadHere ? "1px solid var(--accent)" : "1px solid transparent",
+                            cursor: "pointer", fontSize: 10.5, maxWidth: 130,
+                          }}
+                          title={isLeadHere ? `Remove as lead of ${p.name}` : `Make lead of ${p.name}`}
+                        >
+                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+                          {isLeadHere && <X size={10} />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {isAdmin && !isMe && (
+                removeBusy === m.id ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: 12, color: "var(--text-dim)" }}><Spinner size={13} /> Removing…</div>
+                ) : (
+                  <RemoveMemberButton onConfirm={() => removeMember(m.id)} />
+                )
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Calendar view                                                         */
+/* ------------------------------------------------------------------ */
+const CalendarView = ({ tasks, users, onOpen, workspaceId, canManage }) => {
+  const [cursor, setCursor] = useState(() => { const d = new Date(); d.setDate(1); return d; });
+  const [selected, setSelected] = useState(null);
+  const [holidays, setHolidays] = useState([]);
+  const [addingHoliday, setAddingHoliday] = useState(false);
+  const [holidayName, setHolidayName] = useState("");
+  const [savingHoliday, setSavingHoliday] = useState(false);
+
+  const loadHolidays = async () => {
+    try {
+      const { holidays } = await api.getHolidays(workspaceId);
+      setHolidays(holidays);
+    } catch { /* non-critical, calendar still works without it */ }
+  };
+  useEffect(() => { loadHolidays(); }, [workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const year = cursor.getFullYear();
+  const month = cursor.getMonth();
+  const firstDow = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const todayStr = localDateStr();
+
+  const cells = [];
+  for (let i = 0; i < firstDow; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+  const dateStr = (d) => `${year}-${String(month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  const tasksOn = (d) => tasks.filter((t) => t.due === dateStr(d)).sort((a, b) => (a.dueTime || "99:99").localeCompare(b.dueTime || "99:99"));
+  const holidayOn = (d) => holidays.find((h) => h.date === dateStr(d));
+  const selectedTasks = selected ? tasksOn(selected) : [];
+  const selectedHoliday = selected ? holidayOn(selected) : null;
+
+  const submitHoliday = async (e) => {
+    e.preventDefault();
+    if (!selected || !holidayName.trim()) return;
+    setSavingHoliday(true);
+    try {
+      const { holiday } = await api.addHoliday(workspaceId, dateStr(selected), holidayName.trim());
+      setHolidays((prev) => [...prev.filter((h) => h.date !== holiday.date), holiday]);
+      setHolidayName("");
+      setAddingHoliday(false);
+    } finally {
+      setSavingHoliday(false);
+    }
+  };
+
+  const removeHoliday = async (id) => {
+    await api.deleteHoliday(workspaceId, id);
+    setHolidays((prev) => prev.filter((h) => h.id !== id));
+  };
+
+  return (
+    <div className="tfh-fade-in" style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      <div>
+        <div className="tfh-display" style={{ fontSize: 26, fontWeight: 600, marginBottom: 4 }}>Calendar</div>
+        <div style={{ fontSize: 13.5, color: "var(--text-dim)" }}>Every dot is something due that day. Holidays are marked in gold.</div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 280px", gap: 16 }}>
+        <div className="tfh-card" style={{ padding: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+            <button className="tfh-btn tfh-btn-ghost" onClick={() => setCursor(new Date(year, month - 1, 1))}><ChevronLeft size={16} /></button>
+            <span style={{ fontSize: 14, fontWeight: 700 }}>{cursor.toLocaleDateString(undefined, { month: "long", year: "numeric" })}</span>
+            <button className="tfh-btn tfh-btn-ghost" onClick={() => setCursor(new Date(year, month + 1, 1))}><ChevronRight size={16} /></button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6, marginBottom: 6 }}>
+            {["S", "M", "T", "W", "T", "F", "S"].map((d, i) => <div key={i} style={{ fontSize: 11, color: "var(--text-faint)", textAlign: "center", fontWeight: 600 }}>{d}</div>)}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+            {cells.map((d, i) => {
+              if (!d) return <div key={i} />;
+              const ds = dateStr(d);
+              const dayTasks = tasksOn(d);
+              const holiday = holidayOn(d);
+              const isToday = ds === todayStr;
+              const isSelected = selected === d;
+              return (
+                <button
+                  key={i} onClick={() => setSelected(isSelected ? null : d)} title={holiday?.name}
+                  style={{
+                    aspectRatio: "1", borderRadius: 10,
+                    border: isSelected ? "1.5px solid var(--accent)" : holiday ? "1px solid var(--pri-medium)" : "1px solid var(--line)",
+                    background: holiday ? "var(--accent-soft)" : isToday ? "var(--accent-soft)" : "var(--raised)",
+                    color: "var(--text)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, padding: 2,
+                  }}
+                >
+                  <span style={{ fontSize: 12, fontWeight: isToday || holiday ? 700 : 500 }}>{d}</span>
+                  <div style={{ display: "flex", gap: 2 }}>
+                    {holiday && <span style={{ width: 4, height: 4, borderRadius: 999, background: "#D9A22E" }} />}
+                    {dayTasks.slice(0, 3).map((t) => <span key={t.id} style={{ width: 4, height: 4, borderRadius: 999, background: PRIORITIES[t.priority].color }} />)}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="tfh-card" style={{ padding: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12 }}>
+            {selected ? new Date(dateStr(selected) + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "Pick a day"}
+          </div>
+
+          {selected && selectedHoliday && (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, background: "var(--accent-soft)", borderRadius: 9, padding: "8px 10px", marginBottom: 12 }}>
+              <span style={{ fontSize: 12.5, color: "var(--accent)", fontWeight: 600 }}>🎉 {selectedHoliday.name}</span>
+              {canManage && <button onClick={() => removeHoliday(selectedHoliday.id)} className="tfh-btn tfh-btn-ghost" style={{ padding: 3 }} aria-label="Remove holiday"><X size={12} /></button>}
+            </div>
+          )}
+          {selected && !selectedHoliday && canManage && (
+            addingHoliday ? (
+              <form onSubmit={submitHoliday} style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                <input autoFocus className="tfh-input" placeholder="Holiday name" value={holidayName} onChange={(e) => setHolidayName(e.target.value)} style={{ fontSize: 12.5 }} />
+                <button className="tfh-btn tfh-btn-accent" disabled={savingHoliday || !holidayName.trim()} style={{ flexShrink: 0, fontSize: 12 }}>{savingHoliday ? "…" : "Add"}</button>
+              </form>
+            ) : (
+              <button onClick={() => setAddingHoliday(true)} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11.5, marginBottom: 12 }}>+ Mark as holiday</button>
+            )
+          )}
+
+          {selected && selectedTasks.length === 0 && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>Nothing due this day.</div>}
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {selectedTasks.map((t) => {
+              const a = memberById(users, t.assigneeId);
+              return (
+                <button key={t.id} onClick={() => onOpen(t)} style={{ textAlign: "left", background: "var(--raised)", border: "1px solid var(--line)", borderRadius: 10, padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    {t.dueTime && <span className="tfh-mono" style={{ fontSize: 11, color: "var(--clock)" }}>{formatTimeLabel(t.dueTime)}</span>}
+                    <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{t.title}</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <PriorityChip level={t.priority} />
+                    <Avatar member={a} size={20} />
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Files view — project-level reference documents, not tied to a task    */
+/* ------------------------------------------------------------------ */
+// Renders a project document, and — when `taskId` is set — a file attached
+// to one of the project's activities, fetched from the task-attachment
+// endpoint instead. Same row either way, because to the reader it is the
+// same thing: a file in this project.
+const DocumentRow = ({ doc, workspaceId, projectId, canManage, onRemove, taskId, sourceLabel }) => {
+  const isImage = doc.mimeType.startsWith("image/");
+  const sizeLabel = doc.sizeBytes > 1024 * 1024 ? `${(doc.sizeBytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(doc.sizeBytes / 1024))} KB`;
+
+  const [error, setError] = useState("");
+
+  const openOrDownload = async () => {
+    setError("");
+    // The row already knows the bytes are gone — say so rather than making
+    // a request that will 404.
+    if (doc.missing) {
+      setError("This file is missing from the server's storage and needs re-uploading.");
+      return;
+    }
+    try {
+      const url = taskId
+        ? await api.getAttachmentBlobUrl(workspaceId, projectId, taskId, doc.id)
+        : await api.getDocumentBlobUrl(workspaceId, projectId, doc.id);
+      const a = document.createElement("a");
+      a.href = url;
+      if (isImage || doc.mimeType === "application/pdf") a.target = "_blank"; else a.download = doc.fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    } catch (err) {
+      // Was a silent catch, which is why a failing click looked like
+      // nothing happening at all.
+      setError(err.message || "Couldn't open this file.");
+    }
+  };
+
+  return (
+    <div className="tfh-card" style={{ padding: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", borderColor: doc.missing ? "var(--pri-medium)" : undefined }}>
+      <div style={{ width: 38, height: 38, borderRadius: 9, background: "var(--raised)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+        {doc.missing
+          ? <AlertTriangle size={16} color="var(--pri-medium)" />
+          : isImage ? <ImageIcon size={16} color="var(--text-faint)" /> : <FileText size={16} color="var(--text-faint)" />}
+      </div>
+      <button type="button" onClick={openOrDownload} style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+        <div style={{ fontSize: 13.5, fontWeight: 500, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{doc.fileName}</div>
+        <div style={{ fontSize: 11.5, color: "var(--text-faint)" }}>
+          {sizeLabel} · {doc.uploaderName || "Unknown"} · {new Date(doc.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+          {sourceLabel && <span style={{ color: "var(--accent)" }}> · {sourceLabel}</span>}
+          {doc.missing && <span style={{ color: "var(--pri-medium)", fontWeight: 600 }}> · file missing from storage</span>}
+        </div>
+      </button>
+      <button type="button" onClick={openOrDownload} className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} aria-label="Download"><Download size={14} color="var(--text-faint)" /></button>
+      {canManage && <button type="button" onClick={onRemove} className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} aria-label="Delete"><Trash2 size={14} color="var(--text-faint)" /></button>}
+      {error && <div style={{ flexBasis: "100%", fontSize: 11.5, color: "var(--pri-high)", lineHeight: 1.4 }}>{error}</div>}
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Activity log — a daily entry made of text blocks and table blocks,     */
+/* any number of each, matching the source activity-log documents        */
+/* ------------------------------------------------------------------ */
+const TableBlock = ({ block, onChange, onRemove, readOnly }) => {
+  const rows = block.rows.length ? block.rows : [["", ""]];
+
+  const setCell = (r, c, val) => {
+    const next = rows.map((row, ri) => (ri === r ? row.map((cell, ci) => (ci === c ? val : cell)) : row));
+    onChange({ ...block, rows: next });
+  };
+  const addRow = () => onChange({ ...block, rows: [...rows, rows[0].map(() => "")] });
+  const addCol = () => onChange({ ...block, rows: rows.map((r) => [...r, ""]) });
+  const removeRow = (i) => onChange({ ...block, rows: rows.filter((_, idx) => idx !== i) });
+  const removeCol = (i) => onChange({ ...block, rows: rows.map((r) => r.filter((_, idx) => idx !== i)) });
+
+  return (
+    <div className="tfh-card" style={{ padding: 14, background: "var(--raised)" }}>
+      {!readOnly && (
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button type="button" onClick={addRow} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11, padding: "4px 8px" }}>+ Row</button>
+            <button type="button" onClick={addCol} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11, padding: "4px 8px" }}>+ Column</button>
+          </div>
+          <button type="button" onClick={onRemove} className="tfh-btn tfh-btn-ghost" style={{ padding: 4 }} aria-label="Remove table"><Trash2 size={12} color="var(--pri-high)" /></button>
+        </div>
+      )}
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ borderCollapse: "collapse", width: "100%" }}>
+          <tbody>
+            {rows.map((row, ri) => (
+              <tr key={ri}>
+                {row.map((cell, ci) => (
+                  <td key={ci} style={{ border: "1px solid var(--line)", padding: 0 }}>
+                    {readOnly ? (
+                      <div style={{ padding: "6px 8px", fontSize: 12.5, minWidth: 90 }}>{cell}</div>
+                    ) : (
+                      <input
+                        value={cell} onChange={(e) => setCell(ri, ci, e.target.value)}
+                        style={{ border: "none", background: "transparent", padding: "6px 8px", fontSize: 12.5, width: "100%", minWidth: 90, color: "var(--text)" }}
+                      />
+                    )}
+                  </td>
+                ))}
+                {!readOnly && rows.length > 1 && (
+                  <td style={{ border: "none", padding: "0 4px" }}>
+                    <button type="button" onClick={() => removeRow(ri)} className="tfh-btn tfh-btn-ghost" style={{ padding: 3 }} aria-label="Remove row"><X size={10} color="var(--text-faint)" /></button>
+                  </td>
+                )}
+              </tr>
+            ))}
+            {!readOnly && rows[0].length > 1 && (
+              <tr>
+                {rows[0].map((_, ci) => (
+                  <td key={ci} style={{ border: "none", textAlign: "center", padding: "2px 0" }}>
+                    <button type="button" onClick={() => removeCol(ci)} className="tfh-btn tfh-btn-ghost" style={{ padding: 3 }} aria-label="Remove column"><X size={10} color="var(--text-faint)" /></button>
+                  </td>
+                ))}
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+const TextBlockLinks = ({ links, onChange, readOnly }) => {
+  const [label, setLabel] = useState("");
+  const [url, setUrl] = useState("");
+
+  const add = (e) => {
+    e.preventDefault();
+    if (!url.trim()) return;
+    onChange([...links, { label: label.trim() || url.trim(), url: normalizeUrl(url) }]);
+    setLabel(""); setUrl("");
+  };
+  const remove = (i) => onChange(links.filter((_, idx) => idx !== i));
+
+  if (readOnly) {
+    if (links.length === 0) return null;
+    return (
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+        {links.map((l, i) => (
+          <a key={i} href={normalizeUrl(l.url)} target="_blank" rel="noreferrer" className="tfh-chip tfh-mono tfh-link" style={{ background: "var(--accent-soft)", color: "var(--accent)", textDecoration: "none" }}>
+            <Link2 size={10} /> {l.label}
+          </a>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 6 }}>
+      {links.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 5 }}>
+          {links.map((l, i) => (
+            <span key={i} className="tfh-chip tfh-mono" style={{ background: "var(--raised)", color: "var(--text-dim)" }}>
+              <Link2 size={10} />
+              <a className="tfh-link" href={normalizeUrl(l.url)} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)", textDecoration: "none" }} title={l.url}>{l.label}</a>
+              <button type="button" onClick={() => remove(i)} style={{ background: "none", border: "none", padding: 0, marginLeft: 3, display: "flex", cursor: "pointer" }} aria-label="Remove link"><X size={10} /></button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 5 }}>
+        <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Label" className="tfh-input" style={{ fontSize: 11, flex: "0 0 32%", padding: "5px 8px" }} />
+        <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="Paste a link (Google Drive, etc.)" className="tfh-input" style={{ fontSize: 11, padding: "5px 8px" }} />
+        <button type="button" onClick={add} className="tfh-btn tfh-btn-ghost" style={{ padding: "4px 8px", flexShrink: 0 }} aria-label="Add link"><Plus size={11} /></button>
+      </div>
+    </div>
+  );
+};
+
+const BlockEditor = ({ content, setContent, readOnly, projects, onSetStatus, canSetStatus, statusBusyIndex }) => {
+  const updateBlock = (i, next) => setContent((prev) => prev.map((b, idx) => (idx === i ? next : b)));
+  const removeBlock = (i) => setContent((prev) => prev.filter((_, idx) => idx !== i));
+  const addText = () => setContent((prev) => [...prev, { type: "text", text: "", time: "", links: [], projectId: "", notes: "" }]);
+  const addTable = () => setContent((prev) => [...prev, { type: "table", rows: [["", ""], ["", ""]] }]);
+  const projectName = (id) => projects.find((p) => p.id === id)?.name;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {content.map((block, i) => (
+        <div key={i}>
+          {block.type === "text" ? (
+            readOnly ? (
+              (block.text || block.notes || (block.links || []).length > 0) && (
+                <div>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                    {block.time && <span className="tfh-mono" style={{ fontSize: 11.5, color: "var(--clock)", flexShrink: 0 }}>{formatTimeLabel(block.time)}</span>}
+                    {block.text && (
+                      <div style={{ fontSize: 13, color: block.status === "done" ? "var(--text-dim)" : "var(--text)", textDecoration: block.status === "done" ? "line-through" : "none", whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+                        {block.text}
+                      </div>
+                    )}
+                    <ActivityStatusChip status={block.status} />
+                    {block.projectId && projectName(block.projectId) && (
+                      <span className="tfh-chip" style={{ fontSize: 10, background: "var(--raised)", color: "var(--text-faint)" }}>
+                        <FolderKanban size={9} /> {projectName(block.projectId)}
+                      </span>
+                    )}
+                    {/* Marking off happens on someone's OWN entry, so this
+                        only appears when the viewer owns the log. */}
+                    {canSetStatus && onSetStatus && (
+                      <span style={{ marginLeft: "auto" }}>
+                        <ActivityStatusPicker
+                          compact status={block.status} busy={statusBusyIndex === i}
+                          onChange={(next) => onSetStatus(i, next)}
+                        />
+                      </span>
+                    )}
+                  </div>
+                  {block.notes && <div style={{ fontSize: 12, color: "var(--text-dim)", fontStyle: "italic", marginTop: 3 }}>Notes: {block.notes}</div>}
+                  <TextBlockLinks links={block.links || []} readOnly />
+                </div>
+              )
+            ) : (
+              <div className="tfh-card" style={{ padding: 12, background: "var(--raised)" }}>
+                <div style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "flex-start" }}>
+                  <input
+                    type="time" className="tfh-input" style={{ width: 110, fontSize: 12, flexShrink: 0 }}
+                    value={block.time || ""} onChange={(e) => updateBlock(i, { ...block, time: e.target.value })}
+                    aria-label="Time"
+                  />
+                  <div style={{ position: "relative", flex: 1 }}>
+                    <textarea
+                      className="tfh-input" rows={2} placeholder="What did you work on?"
+                      value={block.text} onChange={(e) => updateBlock(i, { ...block, text: e.target.value })}
+                      style={{ resize: "vertical", paddingRight: 30 }}
+                    />
+                    <button type="button" onClick={() => removeBlock(i)} className="tfh-btn tfh-btn-ghost" style={{ position: "absolute", top: 4, right: 4, padding: 3 }} aria-label="Remove"><X size={11} color="var(--text-faint)" /></button>
+                  </div>
+                </div>
+                <input
+                  className="tfh-input" style={{ fontSize: 11.5, marginBottom: 8 }}
+                  placeholder="Notes from Activity (optional)"
+                  value={block.notes || ""} onChange={(e) => updateBlock(i, { ...block, notes: e.target.value })}
+                  aria-label="Notes from Activity"
+                />
+                <select
+                  className="tfh-input" style={{ fontSize: 11.5, marginBottom: 8 }}
+                  value={block.projectId || ""} onChange={(e) => updateBlock(i, { ...block, projectId: e.target.value })}
+                  aria-label="Which project was this for"
+                >
+                  <option value="">No specific project</option>
+                  {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+                <TextBlockLinks links={block.links || []} onChange={(links) => updateBlock(i, { ...block, links })} />
+                {/* In edit mode the status is just another field on the draft
+                    — it saves with the rest of the entry, no separate call. */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+                  <span style={{ fontSize: 11, color: "var(--text-faint)" }}>Status</span>
+                  <ActivityStatusPicker
+                    compact status={block.status}
+                    onChange={(next) => updateBlock(i, { ...block, status: next || undefined })}
+                  />
+                </div>
+              </div>
+            )
+          ) : (
+            <TableBlock block={block} onChange={(next) => updateBlock(i, next)} onRemove={() => removeBlock(i)} readOnly={readOnly} />
+          )}
+        </div>
+      ))}
+      {content.length === 0 && readOnly && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>Nothing logged for this day.</div>}
+      {!readOnly && (
+        <div style={{ display: "flex", gap: 8 }}>
+          <button type="button" onClick={addText} className="tfh-btn" style={{ fontSize: 12 }}><Plus size={12} /> Add activity</button>
+          <button type="button" onClick={addTable} className="tfh-btn" style={{ fontSize: 12 }}><TableIcon size={12} /> Add table</button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ActivityComments = ({ workspaceId, logId, currentUser, initialCount }) => {
+  const [open, setOpen] = useState((initialCount || 0) > 0); // show existing comments by default
+  const [comments, setComments] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [body, setBody] = useState("");
+  const [posting, setPosting] = useState(false);
+  const [count, setCount] = useState(initialCount || 0);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const { comments: rows } = await api.getActivityLogComments(workspaceId, logId);
+      setComments(rows);
+      setCount(rows.length);
+      setLoaded(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // If the entry already has comments, load and show them straight away —
+  // the Chief wants comments visible alongside the activity, not hidden
+  // behind a click.
+  useEffect(() => {
+    if ((initialCount || 0) > 0 && !loaded) load();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Same live-refresh as task comments: a colleague's reply shows up
+  // without needing to close and reopen the entry.
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket) return;
+    const onActivityComment = (payload) => { if (payload?.logId === logId) load(); };
+    socket.on("activity:comment", onActivityComment);
+    return () => socket.off("activity:comment", onActivityComment);
+  }, [logId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !loaded) load();
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!body.trim()) return;
+    setPosting(true);
+    try {
+      const { comment } = await api.addActivityLogComment(workspaceId, logId, body.trim());
+      setComments((prev) => [...prev, comment]);
+      setCount((c) => c + 1);
+      setBody("");
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  const remove = async (commentId) => {
+    await api.deleteActivityLogComment(workspaceId, logId, commentId);
+    setComments((prev) => prev.filter((c) => c.id !== commentId));
+    setCount((c) => Math.max(0, c - 1));
+  };
+
+  const isManager = currentUser?.role === "admin" || currentUser?.role === "lead";
+
+  return (
+    <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--line)" }}>
+      <button
+        onClick={toggle}
+        className="tfh-btn tfh-btn-ghost"
+        style={{ fontSize: 11.5, padding: "3px 8px", color: "var(--text-dim)" }}
+      >
+        <MessageSquare size={12} /> {count > 0 ? `${count} comment${count === 1 ? "" : "s"}` : "Comment"}
+      </button>
+
+      {open && (
+        <div style={{ marginTop: 10, marginLeft: 12, paddingLeft: 12, borderLeft: "2px solid var(--line)", display: "flex", flexDirection: "column", gap: 8 }}>
+          {loading ? (
+            <div style={{ fontSize: 11.5, color: "var(--text-faint)", paddingLeft: 4 }}>Loading…</div>
+          ) : (
+            comments.map((c) => {
+              const mine = c.authorId === currentUser?.id;
+              return (
+                <div key={c.id} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                  <Avatar member={{ name: c.authorName, color: c.authorColor, initials: c.authorInitials }} size={20} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600 }}>{mine ? "You" : c.authorName}</span>
+                      <span style={{ fontSize: 10.5, color: "var(--text-faint)" }}>{new Date(c.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span>
+                      {(mine || isManager) && (
+                        <button type="button" onClick={() => remove(c.id)} className="tfh-btn tfh-btn-ghost" style={{ padding: 2, marginLeft: "auto" }} aria-label="Delete comment"><X size={10} /></button>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 12.5, color: "var(--text)", whiteSpace: "pre-wrap", lineHeight: 1.4 }}>{c.body}</div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+
+          <form onSubmit={submit} style={{ display: "flex", gap: 6, marginTop: 4 }}>
+            <input
+              className="tfh-input" style={{ fontSize: 12 }} placeholder="Write a comment…"
+              value={body} onChange={(e) => setBody(e.target.value)}
+            />
+            <button className="tfh-btn tfh-btn-accent" disabled={posting || !body.trim()} style={{ flexShrink: 0 }}>{posting ? "…" : "Post"}</button>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// `focus` lets another view hand this one a starting point — the dashboard's
+// logged-activity popup uses it to jump straight to the day (and the right
+// tab: your own log vs the team's) the activity came from.
+const ActivityLogView = ({ workspaceId, currentUser, canManage, projects, focus }) => {
+  const [selectedDate, setSelectedDate] = useState(() => focus?.date || localDateStr());
+  const [myLogs, setMyLogs] = useState([]);
+  const [content, setContent] = useState([]);
+  const [tab, setTab] = useState(focus?.tab || "mine");
+  const [teamLogs, setTeamLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [teamLoading, setTeamLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [attachments, setAttachments] = useState([]);
+  const [attachmentsLoading, setAttachmentsLoading] = useState(false);
+  const fileInputRef = useRef(null);
+  const [uploading, setUploading] = useState(false);
+  const [fileError, setFileError] = useState("");
+  const [activitySearch, setActivitySearch] = useState("");
+  const [popupActivity, setPopupActivity] = useState(null); // {time, text, notes, projectId, links} while adding via popup
+  const [statusBusy, setStatusBusy] = useState(null); // {logId, index} while a mark-off is in flight
+
+  // Marking an activity complete/pending on the Team tab. Goes through the
+  // dedicated endpoint so only that one block changes — see the route for
+  // why this isn't a whole-entry re-PUT.
+  const setTeamBlockStatus = async (log, index, next) => {
+    setStatusBusy({ logId: log.id, index });
+    try {
+      const { log: updated } = await api.setActivityBlockStatus(workspaceId, log.entryDate, index, next);
+      setTeamLogs((prev) => prev.map((l) => (l.id === updated.id ? { ...l, content: updated.content } : l)));
+      // Keep my own copy in step — the same entry is rendered on the Mine tab.
+      setMyLogs((prev) => prev.map((l) => (l.id === updated.id ? { ...l, content: updated.content } : l)));
+      if (updated.entryDate === selectedDate) setContent(updated.content);
+    } finally {
+      setStatusBusy(null);
+    }
+  };
+
+  const loadMine = async () => {
+    setLoading(true);
+    try {
+      const { logs } = await api.getMyActivityLogs(workspaceId);
+      setMyLogs(logs);
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { loadMine(); }, [workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A new focus (a fresh click from the dashboard, even onto the same view)
+  // re-points the day/tab. Keyed on focus.token so clicking the same
+  // activity twice still works.
+  useEffect(() => {
+    if (!focus) return;
+    if (focus.date) setSelectedDate(focus.date);
+    if (focus.tab) setTab(focus.tab);
+  }, [focus?.token]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const existing = myLogs.find((l) => l.entryDate === selectedDate);
+    setContent(existing ? existing.content : []);
+    setSaved(false);
+  }, [selectedDate, myLogs]);
+
+  const entryExists = myLogs.some((l) => l.entryDate === selectedDate);
+
+  useEffect(() => {
+    if (tab !== "mine") return;
+    setAttachmentsLoading(true);
+    setFileError("");
+    api.getActivityLogAttachments(workspaceId, selectedDate).then(({ attachments }) => setAttachments(attachments)).finally(() => setAttachmentsLoading(false));
+  }, [workspaceId, selectedDate, tab, entryExists]);
+
+  const handleFiles = async (fileList) => {
+    const { accepted, rejected } = validateFiles(fileList);
+    if (rejected.length) setFileError(`${rejected.join(", ")} — over the ${MAX_FILE_MB}MB limit, not added.`);
+    else setFileError("");
+    if (accepted.length === 0) return;
+    setUploading(true);
+    try {
+      for (const file of accepted) {
+        const { attachment } = await api.uploadActivityLogAttachment(workspaceId, selectedDate, file);
+        setAttachments((prev) => [...prev, attachment]);
+      }
+    } catch (err) {
+      setFileError(err.message);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+  const removeFile = async (attachmentId) => {
+    await api.deleteActivityLogAttachment(workspaceId, selectedDate, attachmentId);
+    setAttachments((prev) => prev.filter((a) => a.id !== attachmentId));
+  };
+  const openFile = async (attachmentId, fileName, isImage) => {
+    try {
+      const url = await api.getActivityLogAttachmentBlobUrl(workspaceId, selectedDate, attachmentId);
+      const a = document.createElement("a");
+      a.href = url;
+      if (isImage) a.target = "_blank"; else a.download = fileName;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } catch { /* ignore */ }
+  };
+
+  useEffect(() => {
+    if (tab !== "team") return;
+    setTeamLoading(true);
+    api.getTeamActivityLogs(workspaceId).then(({ logs }) => setTeamLogs(logs)).finally(() => setTeamLoading(false));
+  }, [tab, canManage, workspaceId]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const { log } = await api.saveActivityLog(workspaceId, selectedDate, content);
+      setMyLogs((prev) => {
+        const others = prev.filter((l) => l.entryDate !== selectedDate);
+        return [...others, log].sort((a, b) => b.entryDate.localeCompare(a.entryDate));
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // "Add activity" now opens a focused popup (like Quick Add) instead of
+  // appending an inline field at the bottom that you'd have to scroll to.
+  const openActivityPopup = () => setPopupActivity({ time: "", text: "", notes: "", projectId: "", links: [] });
+
+  // Saving the popup appends the one activity to today's entry AND persists
+  // immediately, so the user doesn't then have to hunt for "Save entry".
+  const saveActivityPopup = async () => {
+    if (!popupActivity.text.trim()) { setPopupActivity(null); return; }
+    const block = { type: "text", ...popupActivity };
+    const nextContent = [...content, block];
+    setContent(nextContent);
+    setPopupActivity(null);
+    setSaving(true);
+    try {
+      const { log } = await api.saveActivityLog(workspaceId, selectedDate, nextContent);
+      setMyLogs((prev) => {
+        const others = prev.filter((l) => l.entryDate !== selectedDate);
+        return [...others, log].sort((a, b) => b.entryDate.localeCompare(a.entryDate));
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const groupedByDate = {};
+  teamLogs.forEach((l) => { (groupedByDate[l.entryDate] = groupedByDate[l.entryDate] || []).push(l); });
+
+  return (
+    <div className="tfh-fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div>
+        <div className="tfh-display" style={{ fontSize: 26, fontWeight: 600, marginBottom: 4 }}>Collaboration Log</div>
+        <div style={{ fontSize: 13.5, color: "var(--text-dim)" }}>What you worked on, day by day. Add text notes or tables — as many of each as you need.</div>
+      </div>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <button className={`tfh-btn ${tab === "mine" ? "tfh-btn-accent" : ""}`} onClick={() => setTab("mine")}>My Log</button>
+        <button className={`tfh-btn ${tab === "team" ? "tfh-btn-accent" : ""}`} onClick={() => setTab("team")}>Team Log</button>
+      </div>
+
+      {tab === "mine" ? (
+        <>
+          <div className="tfh-card" style={{ padding: 20 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
+              <DateField style={{ width: 160 }} value={selectedDate} onChange={setSelectedDate} max={localDateStr()} ariaLabel="Log date" />
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                {saved && <span style={{ fontSize: 12, color: "var(--stage-done)" }}>Saved</span>}
+                {/* Add activity is always available at the top (no scrolling
+                    to reach it). Save entry only appears once there's actually
+                    something to save — an empty log has nothing to store. */}
+                <button className="tfh-btn tfh-btn-accent" onClick={openActivityPopup}><Plus size={14} /> Add activity</button>
+                {content.length > 0 && (
+                  <button className="tfh-btn" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save entry"}</button>
+                )}
+              </div>
+            </div>
+            <BlockEditor content={content} setContent={setContent} projects={projects} />
+
+            <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--line)" }}>
+              <div className="tfh-label" style={{ marginBottom: 10 }}>Files for this entry</div>
+              {!entryExists ? (
+                <div style={{ fontSize: 12, color: "var(--text-faint)" }}>Save this day's entry first, then you can attach files here.</div>
+              ) : (
+                <>
+                  {attachmentsLoading ? (
+                    <div style={{ fontSize: 12, color: "var(--text-faint)" }}>Loading…</div>
+                  ) : attachments.length > 0 && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+                      {attachments.map((a) => (
+                        <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 8px", borderRadius: 7, background: "var(--raised)" }}>
+                          {a.mimeType?.startsWith("image/") ? <ImageIcon size={12} color="var(--text-faint)" /> : <Paperclip size={12} color="var(--text-faint)" />}
+                          <button type="button" onClick={() => openFile(a.id, a.fileName, a.mimeType?.startsWith("image/"))} style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", fontSize: 12, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.fileName}</button>
+                          <button type="button" onClick={() => removeFile(a.id)} className="tfh-btn tfh-btn-ghost" style={{ padding: 3 }} aria-label="Remove file"><X size={11} /></button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={(e) => handleFiles(e.target.files)} />
+                  <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11.5, padding: "4px 9px" }}>
+                    <Upload size={11} /> {uploading ? "Uploading…" : "Add file"}
+                  </button>
+                  {fileError && <div style={{ fontSize: 11, color: "var(--pri-high)", marginTop: 6 }}>{fileError}</div>}
+                </>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>Past entries</div>
+              <div style={{ position: "relative", flex: "1 1 200px", maxWidth: 280 }}>
+                <Search size={13} color="var(--text-faint)" style={{ position: "absolute", left: 10, top: 9 }} />
+                <input className="tfh-input" style={{ paddingLeft: 30, fontSize: 12 }} placeholder="Search activities" value={activitySearch} onChange={(e) => setActivitySearch(e.target.value)} />
+              </div>
+            </div>
+            {loading ? (
+              <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>Loading…</div>
+            ) : (() => {
+              const q = activitySearch.trim().toLowerCase();
+              const visible = q
+                ? myLogs.filter((l) =>
+                    l.content.some((b) => b.type === "text" && ((b.text || "").toLowerCase().includes(q) || (b.notes || "").toLowerCase().includes(q)))
+                    || new Date(l.entryDate + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" }).toLowerCase().includes(q)
+                  )
+                : myLogs;
+              if (myLogs.length === 0) return <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>No entries yet.</div>;
+              if (visible.length === 0) return <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>No activities match “{activitySearch}”.</div>;
+              return (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {visible.map((l) => (
+                    <button key={l.id} onClick={() => setSelectedDate(l.entryDate)} className="tfh-card" style={{ padding: "10px 14px", textAlign: "left", display: "flex", alignItems: "center", justifyContent: "space-between", border: l.entryDate === selectedDate ? "1px solid var(--accent)" : undefined }}>
+                      <span style={{ fontSize: 12.5, fontWeight: 600 }}>{new Date(l.entryDate + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}</span>
+                      <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{l.content.length} {l.content.length === 1 ? "activity" : "activities"}</span>
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
+          </div>
+        </>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+          {teamLoading ? (
+            <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>Loading…</div>
+          ) : Object.keys(groupedByDate).length === 0 ? (
+            <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>No entries logged by the team yet.</div>
+          ) : (
+            Object.entries(groupedByDate).sort((a, b) => b[0].localeCompare(a[0])).map(([date, entries]) => (
+              <div key={date}>
+                <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10 }}>{new Date(date + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {entries.map((l) => (
+                    <div key={l.id} className="tfh-card" style={{ padding: 16 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                        <Avatar member={{ name: l.userName, color: l.userColor, initials: l.userInitials }} size={22} />
+                        <span style={{ fontSize: 13, fontWeight: 600 }}>{l.userName}</span>
+                      </div>
+                      <BlockEditor
+                        content={l.content} setContent={() => {}} readOnly projects={projects}
+                        canSetStatus={l.userId === currentUser?.id}
+                        statusBusyIndex={statusBusy?.logId === l.id ? statusBusy.index : null}
+                        onSetStatus={(index, next) => setTeamBlockStatus(l, index, next)}
+                      />
+                      <ActivityComments workspaceId={workspaceId} logId={l.id} currentUser={currentUser} initialCount={l.commentCount} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {popupActivity && (
+        <div className="tfh-modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setPopupActivity(null); }}>
+          <div className="tfh-card tfh-modal-card" style={{ width: "100%", maxWidth: 460, padding: 22 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <span className="tfh-display" style={{ fontSize: 19, fontWeight: 600 }}>Add activity</span>
+              <button className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={() => setPopupActivity(null)} aria-label="Close"><X size={16} /></button>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              <input type="time" className="tfh-input" style={{ width: 120, flexShrink: 0 }} value={popupActivity.time} onChange={(e) => setPopupActivity({ ...popupActivity, time: e.target.value })} aria-label="Time" />
+              <input autoFocus className="tfh-input" placeholder="What did you work on?" value={popupActivity.text} onChange={(e) => setPopupActivity({ ...popupActivity, text: e.target.value })} />
+            </div>
+
+            <label className="tfh-label">Notes from Activity <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(optional)</span></label>
+            <input className="tfh-input" style={{ marginBottom: 12 }} placeholder="Any notes" value={popupActivity.notes} onChange={(e) => setPopupActivity({ ...popupActivity, notes: e.target.value })} />
+
+            <label className="tfh-label">Project <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(optional)</span></label>
+            <select className="tfh-input" style={{ marginBottom: 18 }} value={popupActivity.projectId} onChange={(e) => setPopupActivity({ ...popupActivity, projectId: e.target.value })}>
+              <option value="">No specific project</option>
+              {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, borderTop: "1px solid var(--line)", paddingTop: 16 }}>
+              <button className="tfh-btn" onClick={() => setPopupActivity(null)} disabled={saving}>Cancel</button>
+              <button className="tfh-btn tfh-btn-accent" onClick={saveActivityPopup} disabled={saving || !popupActivity.text.trim()}>{saving ? "Saving…" : "Add activity"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// `projectId` is the app's currently-selected project and seeds the picker;
+// after that the picker owns which project is shown, so you can browse
+// another project's files without leaving the page or changing what the
+// rest of the app is pointed at.
+//
+// `canManage` is deliberately NOT passed in pre-decided: whether you can
+// upload here depends on the project you've PICKED, not the one selected in
+// the sidebar. Getting that wrong would have shown an Upload button on a
+// project you don't lead (and the server would then reject it).
+// The Board's files column. Same data as the Files page, read-only and
+// condensed — the point is "what's attached to this project" at a glance
+// while you're looking at its tasks, not another place to manage files.
+// Only renders for ONE project: with "All projects" selected there's no
+// single set of files to show.
+const BoardFilesPanel = ({ workspaceId, projectId, projectName, onOpenFiles }) => {
+  const [docs, setDocs] = useState([]);
+  const [links, setLinks] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    setLoading(true);
+    Promise.all([api.getDocuments(workspaceId, projectId), api.getProjectLinks(workspaceId, projectId)])
+      .then(([d, l]) => { if (!cancelled) { setDocs(d.documents); setLinks(l.links); } })
+      .catch(() => { if (!cancelled) { setDocs([]); setLinks([]); } })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [workspaceId, projectId]);
+
+  const total = docs.length + links.length;
+
+  const [openError, setOpenError] = useState("");
+
+  const openDoc = async (doc) => {
+    setOpenError("");
+    if (doc.missing) {
+      setOpenError(`"${doc.fileName}" is no longer in storage — it needs re-uploading.`);
+      return;
+    }
+    try {
+      const url = await api.getDocumentBlobUrl(workspaceId, projectId, doc.id);
+      const a = document.createElement("a");
+      a.href = url;
+      if ((doc.mimeType || "").startsWith("image/")) a.target = "_blank"; else a.download = doc.fileName;
+      document.body.appendChild(a); a.click(); a.remove();
+      // The blob stays in memory until revoked; the click has already been
+      // handed off by the time this runs.
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    } catch (err) {
+      // This used to be an empty catch, so a failed open did NOTHING
+      // visible — the "I click these files and they don't open" report.
+      setOpenError(err.message || `Couldn't open "${doc.fileName}".`);
+    }
+  };
+
+  return (
+    <div className="tfh-card" style={{ padding: 12, display: "flex", flexDirection: "column", minHeight: 200 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10 }}>
+        <FolderOpen size={13} color="var(--accent)" />
+        <span style={{ fontSize: 12.5, fontWeight: 700 }}>Files</span>
+        {total > 0 && <span className="tfh-chip tfh-mono" style={{ background: "var(--raised)", color: "var(--text-dim)", fontSize: 10.5 }}>{total}</span>}
+        <button
+          onClick={onOpenFiles} className="tfh-btn tfh-btn-ghost"
+          style={{ marginLeft: "auto", fontSize: 10.5, padding: "2px 7px" }}
+          title={`Manage files for ${projectName || "this project"}`}
+        >
+          Manage
+        </button>
+      </div>
+
+      {openError && (
+        <div style={{ fontSize: 11, color: "var(--pri-high)", marginBottom: 8, lineHeight: 1.4 }}>{openError}</div>
+      )}
+      {loading ? (
+        <div style={{ padding: "14px 4px", textAlign: "center" }}><Spinner size={16} /></div>
+      ) : total === 0 ? (
+        <div style={{ fontSize: 11.5, color: "var(--text-faint)", padding: "4px 4px", lineHeight: 1.5 }}>
+          No files on this project yet.
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, overflowY: "auto" }}>
+          {docs.map((d) => (
+            <button
+              key={d.id} onClick={() => openDoc(d)} className="tfh-search-result"
+              style={{ padding: "6px 8px", gap: 7, opacity: d.missing ? 0.6 : 1 }}
+              title={d.missing ? `${d.fileName} — file missing from storage` : d.fileName}
+            >
+              {d.missing
+                ? <AlertTriangle size={12} color="var(--pri-medium)" style={{ flexShrink: 0 }} />
+                : (d.mimeType || "").startsWith("image/") ? <ImageIcon size={12} color="var(--text-faint)" style={{ flexShrink: 0 }} /> : <FileText size={12} color="var(--text-faint)" style={{ flexShrink: 0 }} />}
+              <span style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.fileName}</span>
+            </button>
+          ))}
+          {links.map((l) => (
+            <a
+              key={l.id} href={normalizeUrl(l.url)} target="_blank" rel="noopener noreferrer"
+              className="tfh-search-result" style={{ padding: "6px 8px", gap: 7, textDecoration: "none" }} title={l.url}
+            >
+              <Link2 size={12} color="var(--accent)" style={{ flexShrink: 0 }} />
+              <span style={{ fontSize: 12, color: "var(--accent)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.label}</span>
+            </a>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const DocumentsView = ({ workspaceId, projectId, projects, projectName, isWorkspaceManager, currentUserId }) => {
+  const [selectedId, setSelectedId] = useState(projectId || "");
+  // Follow the sidebar when it changes — switching project there and then
+  // opening Files should show that project, not whatever was last picked.
+  useEffect(() => { if (projectId) setSelectedId(projectId); }, [projectId]);
+
+  const selectedProject = projects?.find((p) => p.id === selectedId);
+  const canManage = isWorkspaceManager || selectedProject?.leadId === currentUserId;
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+  const fileInputRef = useRef(null);
+  // Not everything worth keeping here is a file to upload — a lot of the
+  // department's reference material already lives in Google Drive. Links
+  // sit alongside the uploads rather than in a separate place.
+  const [links, setLinks] = useState([]);
+  // Files and links that came in through an activity rather than being
+  // uploaded here. They're listed separately so it's clear where each one
+  // came from, but they ARE on this page — uploading a file to an activity
+  // and then not finding it under Files is what prompted this.
+  const [taskFiles, setTaskFiles] = useState([]);
+  const [taskLinks, setTaskLinks] = useState([]);
+
+  // `quiet` skips the loading state: a socket-driven refresh shouldn't blank
+  // the page someone is reading.
+  const load = async (quiet = false) => {
+    if (!quiet) setLoading(true);
+    try {
+      const [docs, { links: rows }] = await Promise.all([
+        api.getDocuments(workspaceId, selectedId),
+        api.getProjectLinks(workspaceId, selectedId),
+      ]);
+      setItems(docs.documents);
+      setTaskFiles(docs.taskFiles || []);
+      setTaskLinks(docs.taskLinks || []);
+      setLinks(rows);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      if (!quiet) setLoading(false);
+    }
+  };
+
+  // Drag & drop onto the page. dragDepth counts enter/leave pairs: a single
+  // boolean flickers off the moment the pointer crosses a child element,
+  // which makes the highlight strobe as you move across the drop area.
+  const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
+
+  const canUpload = canManage && FILE_UPLOADS_ENABLED;
+  const onDragEnter = (e) => {
+    if (!canUpload || !e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    dragDepth.current += 1;
+    setDragging(true);
+  };
+  const onDragLeave = () => {
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragging(false);
+  };
+  const onDragOver = (e) => {
+    if (!canUpload || !e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault(); // without this the browser just opens the file
+    e.dataTransfer.dropEffect = "copy";
+  };
+  const onDrop = (e) => {
+    if (!canUpload) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragging(false);
+    const files = e.dataTransfer?.files;
+    if (files?.length) handleFiles(files);
+  };
+
+  const addLink = async (label, url) => {
+    const { link } = await api.addProjectLink(workspaceId, selectedId, label, url);
+    setLinks((prev) => [...prev, link]);
+  };
+  const removeLink = async (linkId) => {
+    await api.deleteProjectLink(workspaceId, selectedId, linkId);
+    setLinks((prev) => prev.filter((l) => l.id !== linkId));
+  };
+
+  useEffect(() => { if (selectedId) load(); }, [workspaceId, selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fetch-once was the bug: a file uploaded from an activity (or by someone
+  // else, in another tab) never appeared here until a manual reload. The
+  // server broadcasts documents:changed on every file and link change
+  // anywhere in the project, including from tasks.
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket || !selectedId) return undefined;
+    const onDocumentsChanged = (payload) => {
+      if (payload?.projectId && payload.projectId !== selectedId) return;
+      load(true);
+    };
+    socket.on("documents:changed", onDocumentsChanged);
+    return () => socket.off("documents:changed", onDocumentsChanged);
+  }, [workspaceId, selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setUploading(true);
+    setError("");
+    try {
+      for (const file of files) await api.uploadDocument(workspaceId, selectedId, file);
+      await load();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const remove = async (id) => {
+    try {
+      await api.deleteDocument(workspaceId, selectedId, id);
+      setItems((prev) => prev.filter((d) => d.id !== id));
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  return (
+    <div
+      className="tfh-fade-in"
+      style={{ display: "flex", flexDirection: "column", gap: 20, position: "relative", minHeight: 420 }}
+      onDragEnter={onDragEnter} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}
+    >
+      {dragging && (
+        <div className="tfh-dropzone" aria-hidden="true">
+          <Upload size={26} color="var(--accent)" />
+          <div style={{ fontSize: 15, fontWeight: 700, marginTop: 10 }}>Drop files to upload</div>
+          <div style={{ fontSize: 12.5, color: "var(--text-dim)", marginTop: 4 }}>
+            They'll be added to {selectedProject?.name || "this project"}
+          </div>
+        </div>
+      )}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <div className="tfh-display" style={{ fontSize: 26, fontWeight: 600, marginBottom: 4 }}>Files</div>
+          <div style={{ fontSize: 13.5, color: "var(--text-dim)" }}>Google Drive links and reference material, kept per project — visible to everyone here, not tied to a single task.</div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          {/* Pick which project's files you're looking at, without leaving
+              the page. Completed projects stay in the list — their files are
+              often exactly what someone comes here for. */}
+          <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+            <FolderKanban size={14} color="var(--text-faint)" />
+            <select
+              className="tfh-input"
+              style={{ fontSize: 12.5, minWidth: 210, paddingTop: 7, paddingBottom: 7 }}
+              value={selectedId}
+              onChange={(e) => setSelectedId(e.target.value)}
+              aria-label="Show files for project"
+            >
+              {(projects || []).map((p) => (
+                <option key={p.id} value={p.id}>{p.name}{p.completedAt ? " (completed)" : ""}</option>
+              ))}
+            </select>
+          </div>
+          {canUpload && (
+            <>
+              <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={(e) => handleFiles(e.target.files)} />
+              <button className="tfh-btn tfh-btn-accent" onClick={() => fileInputRef.current?.click()} disabled={uploading || !selectedId}>
+                <Upload size={14} /> {uploading ? "Uploading…" : "Upload file"}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* A plain member looking at a project they don't lead can read
+          everything here but not add to it — say so, rather than just
+          silently hiding the controls. */}
+      {!canManage && selectedProject && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--text-dim)", background: "var(--raised)", padding: "9px 12px", borderRadius: 10 }}>
+          <Lock size={13} /> View only — your admin, team lead, or this project's lead can add files and links here.
+        </div>
+      )}
+
+      {error && <div style={{ fontSize: 12.5, color: "var(--pri-high)" }}>{error}</div>}
+
+      {loading ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: 30, justifyContent: "center" }}><Spinner /> <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Loading files…</span></div>
+      ) : (
+        <>
+          {/* FILES — the project's own Google Drive links. First on the page,
+              above "From activities", because this is the project's shelf;
+              the activity files below are a by-product of individual collabs.
+              (Same project-links data the Milestones page used to show as
+              "Project reference links" — it lives here only now.) */}
+          <div className="tfh-card" style={{ padding: 18 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+              <FolderOpen size={14} color="var(--accent)" />
+              <span style={{ fontSize: 13, fontWeight: 700 }}>Files</span>
+              {links.length > 0 && <span className="tfh-chip" style={{ fontSize: 10, background: "var(--raised)", color: "var(--text-dim)" }}>{links.length}</span>}
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 10 }}>
+              {canManage
+                ? "Paste the Google Drive link to a file or folder (or a Sheet, or any URL). Give it a label so people know what it is."
+                : `Google Drive links for ${selectedProject?.name || "this project"}.`}
+            </div>
+            <LinksList links={links} canManage={canManage} onAdd={addLink} onRemove={removeLink} />
+          </div>
+
+          {/* Files uploaded before uploads were switched off. Shown only if
+              there are any, so they stay reachable without inviting more. */}
+          {items.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+                <FileText size={14} color="var(--accent)" />
+                <span style={{ fontSize: 13, fontWeight: 700 }}>{FILE_UPLOADS_ENABLED ? "Uploaded files" : "Uploaded earlier"}</span>
+                <span className="tfh-chip" style={{ fontSize: 10, background: "var(--raised)", color: "var(--text-dim)" }}>{items.length}</span>
+                {!FILE_UPLOADS_ENABLED && <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>From before files moved to Google Drive links</span>}
+              </div>
+              {items.map((doc) => (
+                <DocumentRow key={doc.id} doc={doc} workspaceId={workspaceId} projectId={selectedId} canManage={canManage} onRemove={() => remove(doc.id)} />
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Files that arrived through an activity. Read-only here: they belong
+          to the activity that carries them, and removing one from under it
+          would leave that activity pointing at nothing. */}
+      {!loading && (taskFiles.length > 0 || taskLinks.length > 0) && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+            <Paperclip size={14} color="var(--accent)" />
+            <span style={{ fontSize: 13, fontWeight: 700 }}>From activities</span>
+            <span className="tfh-chip" style={{ fontSize: 10, background: "var(--raised)", color: "var(--text-dim)" }}>{taskFiles.length + taskLinks.length}</span>
+            <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>Added to a collab in this project</span>
+          </div>
+          {taskFiles.map((f) => (
+            <DocumentRow
+              key={f.id} doc={f} workspaceId={workspaceId} projectId={selectedId}
+              taskId={f.taskId} sourceLabel={f.taskTitle} canManage={false} onRemove={() => {}}
+            />
+          ))}
+          {taskLinks.map((l) => (
+            <div key={l.id} className="tfh-card" style={{ padding: 14, display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ width: 38, height: 38, borderRadius: 9, background: "var(--raised)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                <Link2 size={16} color="var(--text-faint)" />
+              </div>
+              <a href={l.url} target="_blank" rel="noreferrer" style={{ flex: 1, minWidth: 0, textDecoration: "none" }}>
+                <div style={{ fontSize: 13.5, fontWeight: 500, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{l.label || l.url}</div>
+                <div style={{ fontSize: 11.5, color: "var(--text-faint)" }}>
+                  {l.adderName || "Unknown"} · <span style={{ color: "var(--accent)" }}>{l.taskTitle}</span>
+                </div>
+              </a>
+            </div>
+          ))}
+        </div>
+      )}
+
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Milestone view — exactly one per project, editable by admin/lead      */
+/* ------------------------------------------------------------------ */
+const LinksList = ({ links, canManage, onAdd, onRemove, compact }) => {
+  const [label, setLabel] = useState("");
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!url.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await onAdd(label.trim(), normalizeUrl(url));
+      setLabel(""); setUrl("");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      {links.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: canManage ? 10 : 0 }}>
+          {links.map((l) => (
+            <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: compact ? "5px 8px" : "6px 8px", borderRadius: 8, background: "var(--raised)" }}>
+              <Link2 size={13} color="var(--text-faint)" style={{ flexShrink: 0 }} />
+              <a className="tfh-link" href={normalizeUrl(l.url)} target="_blank" rel="noopener noreferrer" style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: "var(--accent)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", textDecoration: "none" }}>{l.label}</a>
+              {canManage && <button type="button" onClick={() => onRemove(l.id)} className="tfh-btn tfh-btn-ghost" style={{ padding: 4 }} aria-label="Remove link"><X size={12} color="var(--text-faint)" /></button>}
+            </div>
+          ))}
+        </div>
+      )}
+      {links.length === 0 && !canManage && <div style={{ fontSize: 12, color: "var(--text-faint)" }}>No links yet.</div>}
+      {canManage && (
+        <form onSubmit={submit} style={{ display: "flex", gap: 6 }}>
+          <input className="tfh-input" placeholder="Label (optional)" value={label} onChange={(e) => setLabel(e.target.value)} style={{ flex: "0 0 38%", fontSize: 12.5 }} />
+          <input className="tfh-input" placeholder="https://…" value={url} onChange={(e) => setUrl(e.target.value)} style={{ fontSize: 12.5 }} />
+          <button className="tfh-btn" disabled={busy || !url.trim()} style={{ flexShrink: 0 }}><Plus size={13} /></button>
+        </form>
+      )}
+      {error && <div style={{ fontSize: 11.5, color: "var(--pri-high)", marginTop: 6 }}>{error}</div>}
+    </div>
+  );
+};
+
+const MilestoneAttachmentsMini = ({ workspaceId, projectId, milestoneId, attachments, canManage, onAdd, onRemove }) => {
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const handleFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setUploading(true);
+    try {
+      for (const file of files) {
+        const { attachment } = await api.uploadMilestoneAttachment(workspaceId, projectId, milestoneId, file);
+        onAdd(attachment);
+      }
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const openFile = async (attachmentId, fileName, isImage) => {
+    try {
+      const url = await api.getMilestoneAttachmentBlobUrl(workspaceId, projectId, milestoneId, attachmentId);
+      const a = document.createElement("a");
+      a.href = url;
+      if (isImage) a.target = "_blank"; else a.download = fileName;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } catch { /* ignore — row stays put to retry */ }
+  };
+
+  const remove = async (id) => {
+    await api.deleteMilestoneAttachment(workspaceId, projectId, milestoneId, id);
+    onRemove(id);
+  };
+
+  return (
+    <div style={{ marginTop: 10 }}>
+      {(attachments || []).length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: canManage ? 6 : 0 }}>
+          {attachments.map((a) => (
+            <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 8px", borderRadius: 7, background: "var(--raised)" }}>
+              {a.mimeType?.startsWith("image/") ? <ImageIcon size={12} color="var(--text-faint)" /> : <Paperclip size={12} color="var(--text-faint)" />}
+              <button type="button" onClick={() => openFile(a.id, a.fileName, a.mimeType?.startsWith("image/"))} style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", fontSize: 12, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.fileName}</button>
+              {canManage && <button type="button" onClick={() => remove(a.id)} className="tfh-btn tfh-btn-ghost" style={{ padding: 3 }} aria-label="Remove file"><X size={11} /></button>}
+            </div>
+          ))}
+        </div>
+      )}
+      {canManage && FILE_UPLOADS_ENABLED && (
+        <>
+          <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={(e) => handleFiles(e.target.files)} />
+          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11, padding: "4px 8px" }}>
+            <Upload size={11} /> {uploading ? "Uploading…" : "Add file"}
+          </button>
+        </>
+      )}
+    </div>
+  );
+};
+
+/**
+ * Project details — name, description, start date, deadline. Opened from the
+ * pencil on a project in the sidebar. These used to sit at the top of the
+ * Milestones page as "Project timeline", which made that page about two
+ * different things at once.
+ */
+const ProjectDetailsModal = ({ workspaceId, project, onClose, onSaved }) => {
+  const [reportBusy, setReportBusy] = useState(false);
+  const [reportNote, setReportNote] = useState("");
+  const downloadReport = async () => {
+    setReportBusy(true); setReportNote("");
+    try { setReportNote(`Saved ${saveReportBlob(await api.downloadProjectReport(workspaceId, { projectId: project.id }))}`); }
+    catch (err) { setReportNote(err.message || "Couldn't build the project report."); }
+    finally { setReportBusy(false); }
+  };
+  const [name, setName] = useState(project.name || "");
+  const [description, setDescription] = useState(project.description || "");
+  const [deadline, setDeadline] = useState(project.deadline || "");
+  const [startDate, setStartDate] = useState(project.hasExplicitStartDate ? project.startDate : "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape" && !saving) onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, saving]);
+
+  const save = async (e) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setSaving(true);
+    setError("");
+    try {
+      await api.updateProject(workspaceId, project.id, { name: name.trim(), description, deadline: deadline || null, startDate: startDate || null });
+      await onSaved();
+      onClose();
+    } catch (err) {
+      setError(err.message);
+      setSaving(false);
+    }
+  };
+
+  const created = project.createdAt ? milestoneDate(localDateStr(new Date(project.createdAt))) : "";
+
+  return (
+    <div className="tfh-modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget && !saving) onClose(); }}>
+      <form onSubmit={save} className="tfh-card tfh-modal-card" style={{ width: "100%", maxWidth: 520, padding: 22 }} role="dialog" aria-label={`Project details — ${project.name}`}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <span className="tfh-display" style={{ fontSize: 19, fontWeight: 600 }}>Project details</span>
+          <button type="button" className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+        <label className="tfh-label" htmlFor="proj-edit-name">Project name</label>
+        <input id="proj-edit-name" autoFocus className="tfh-input" value={name} onChange={(e) => setName(e.target.value)} style={{ marginBottom: 12 }} />
+        <label className="tfh-label" htmlFor="proj-edit-desc">Description</label>
+        <textarea id="proj-edit-desc" className="tfh-input" rows={3} value={description} onChange={(e) => setDescription(e.target.value)} style={{ marginBottom: 12, resize: "vertical" }} />
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 6 }}>
+          <div>
+            <label className="tfh-label" htmlFor="proj-edit-start">Start date</label>
+            <DateField id="proj-edit-start" value={startDate || ""} onChange={setStartDate} ariaLabel="Project start date" />
+          </div>
+          <div>
+            <label className="tfh-label" htmlFor="proj-edit-deadline">Deadline</label>
+            <DateField id="proj-edit-deadline" value={deadline || ""} onChange={setDeadline} ariaLabel="Project deadline" />
+          </div>
+        </div>
+        <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 14 }}>
+          Leave the start date blank to use the day the project was created{created ? ` (${created})` : ""}.
+          {" "}The project's lead is set under Team.
+        </div>
+        {error && <div role="alert" style={{ fontSize: 12, color: "var(--pri-high)", marginBottom: 12 }}>{error}</div>}
+        {reportNote && <div style={{ fontSize: 11.5, color: reportNote.startsWith("Saved") ? "var(--stage-done)" : "var(--pri-high)", marginBottom: 10 }}>{reportNote}</div>}
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", borderTop: "1px solid var(--line)", paddingTop: 14 }}>
+          {/* The whole project's history as a Word document, in date order.
+              Date-ranged copies are on the Team page. */}
+          <button
+            type="button" className="tfh-btn tfh-btn-ghost" onClick={downloadReport} disabled={reportBusy}
+            style={{ marginRight: "auto" }} title="Every activity on this project, in date order, as a Word document"
+          >
+            <Download size={13} /> {reportBusy ? "Building…" : "Project report"}
+          </button>
+          <button type="button" className="tfh-btn" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="tfh-btn tfh-btn-accent" disabled={saving || !name.trim()}>{saving ? "Saving…" : "Save"}</button>
+        </div>
+      </form>
+    </div>
+  );
+};
+
+// "Wed 30 Sept 2026". Milestones span years, so unlike the agenda headings
+// this one carries the year. Day-first, built by hand (see dayAndDate).
+const milestoneDate = (dateStr) => {
+  const p = dateParts(dateStr);
+  return p ? `${WEEKDAY_NAMES[p.weekday]} ${p.d} ${MONTH_NAMES[p.m - 1]} ${p.y}` : "";
+};
+
+// "Today", "in 5 days", "12 days ago" — how far a milestone is from today,
+// counted on calendar dates at UTC noon so no timezone can shift it a day.
+const daysFromToday = (dateStr) => {
+  const p = dateParts(dateStr);
+  if (!p) return null;
+  const t = dateParts(localDateStr());
+  return Math.round((Date.UTC(p.y, p.m - 1, p.d, 12) - Date.UTC(t.y, t.m - 1, t.d, 12)) / 86400000);
+};
+const relativeDay = (n) => {
+  if (n == null) return "";
+  if (n === 0) return "Today";
+  if (n === 1) return "Tomorrow";
+  if (n === -1) return "Yesterday";
+  return n > 0 ? `in ${n} days` : `${-n} days ago`;
+};
+
+const EMPTY_MILESTONE_FORM = { targetDate: "", title: "", projectId: "", description: "", linkLabel: "", linkUrl: "" };
+
+/**
+ * The milestone form, laid out the way the Chief drew it:
+ *
+ *   Date of Milestone   Milestone Title    Project Name (select)
+ *   Details of Milestone   Link to File     https://…
+ *
+ * Used both to add a milestone and to edit one in place. `existingLinks` is
+ * only passed when editing: older milestones can carry several links, and
+ * they're listed (removable) above the one-link input rather than squeezed
+ * into it.
+ */
+const MilestoneForm = ({ initial, projects, submitLabel, busyLabel, onSubmit, onCancel, existingLinks, onRemoveExistingLink, autoFocusTitle }) => {
+  const [form, setForm] = useState(() => ({ ...EMPTY_MILESTONE_FORM, ...initial }));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const set = (key) => (value) => setForm((f) => ({ ...f, [key]: value }));
+
+  // When the sidebar project changes, a blank add-form follows it — but never
+  // overwrite a project someone has already picked here.
+  useEffect(() => {
+    if (initial?.projectId && !form.projectId) setForm((f) => ({ ...f, projectId: initial.projectId }));
+  }, [initial?.projectId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const missing = [
+    !form.targetDate && "the date",
+    !form.title.trim() && "a title",
+    !form.projectId && "the project",
+  ].filter(Boolean);
+  const linkHalfFilled = Boolean(form.linkLabel.trim()) && !form.linkUrl.trim();
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (missing.length) { setError(`Please add ${missing.join(", ").replace(/, ([^,]*)$/, " and $1")}.`); return; }
+    if (linkHalfFilled) { setError("Paste the link (https://…) for the file, or clear its name."); return; }
+    setBusy(true);
+    setError("");
+    try {
+      await onSubmit({
+        targetDate: form.targetDate,
+        title: form.title.trim(),
+        projectId: form.projectId,
+        description: form.description.trim(),
+        link: form.linkUrl.trim() ? { label: form.linkLabel.trim(), url: normalizeUrl(form.linkUrl) } : null,
+      });
+      if (!onCancel) setForm((f) => ({ ...EMPTY_MILESTONE_FORM, projectId: f.projectId })); // add-form: ready for the next one, same project
+    } catch (err) {
+      setError(err.message || "Couldn't save the milestone.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const active = projects.filter((p) => !p.completedAt || p.id === form.projectId);
+
+  return (
+    <form onSubmit={submit} className="tfh-milestone-form" noValidate>
+      <div className="tfh-milestone-grid">
+        <div>
+          <label className="tfh-label" htmlFor="ms-date">Date of milestone</label>
+          <DateField id="ms-date" value={form.targetDate} onChange={set("targetDate")} ariaLabel="Date of milestone" />
+        </div>
+        <div>
+          <label className="tfh-label" htmlFor="ms-title">Milestone title</label>
+          <input
+            id="ms-title" className="tfh-input" placeholder="e.g. Cabinet approval received"
+            value={form.title} onChange={(e) => set("title")(e.target.value)} autoFocus={autoFocusTitle}
+          />
+        </div>
+        <div>
+          <label className="tfh-label" htmlFor="ms-project">Project name</label>
+          <select id="ms-project" className="tfh-input" value={form.projectId} onChange={(e) => set("projectId")(e.target.value)}>
+            <option value="" disabled>Select a project…</option>
+            {active.map((p) => <option key={p.id} value={p.id}>{p.name}{p.completedAt ? " (completed)" : ""}</option>)}
+          </select>
+        </div>
+        <div className="tfh-milestone-details">
+          <label className="tfh-label" htmlFor="ms-details">Details of milestone</label>
+          <textarea
+            id="ms-details" className="tfh-input" rows={2} placeholder="What was achieved, decided or delivered"
+            value={form.description} onChange={(e) => set("description")(e.target.value)} style={{ resize: "vertical" }}
+          />
+        </div>
+        <div>
+          <label className="tfh-label" htmlFor="ms-link-label">Link to file</label>
+          <input
+            id="ms-link-label" className="tfh-input" placeholder="File name (optional)"
+            value={form.linkLabel} onChange={(e) => set("linkLabel")(e.target.value)}
+          />
+        </div>
+        <div>
+          <label className="tfh-label" htmlFor="ms-link-url">Google Drive link</label>
+          <input
+            id="ms-link-url" className="tfh-input" placeholder="https://…" inputMode="url"
+            value={form.linkUrl} onChange={(e) => set("linkUrl")(e.target.value)}
+          />
+        </div>
+      </div>
+
+      {existingLinks?.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 12 }}>
+          {existingLinks.map((l) => (
+            <span key={l.id} className="tfh-chip" style={{ background: "var(--raised)", color: "var(--accent)", gap: 6, maxWidth: 280 }}>
+              <Link2 size={11} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.label}</span>
+              <button
+                type="button" onClick={() => onRemoveExistingLink(l.id)} className="tfh-btn tfh-btn-ghost"
+                style={{ padding: 1 }} aria-label={`Remove link ${l.label}`} title="Remove this link"
+              >
+                <X size={11} />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {error && <div role="alert" style={{ fontSize: 12, color: "var(--pri-high)", marginTop: 12 }}>{error}</div>}
+
+      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
+        {onCancel
+          ? <button type="button" className="tfh-btn" onClick={onCancel} disabled={busy}>Cancel</button>
+          : (form.title || form.description || form.linkUrl || form.linkLabel || form.targetDate) && (
+            <button type="button" className="tfh-btn tfh-btn-ghost" onClick={() => { setForm((f) => ({ ...EMPTY_MILESTONE_FORM, projectId: f.projectId })); setError(""); }} disabled={busy}>Clear</button>
+          )}
+        <button className="tfh-btn tfh-btn-accent" disabled={busy}>
+          {onCancel ? <Check size={14} /> : <Plus size={14} />} {busy ? busyLabel : submitLabel}
+        </button>
+      </div>
+    </form>
+  );
+};
+
+const MilestoneRow = ({ milestone, projects, canManage, workspaceId, onSave, onDelete, onRemoveLink, onAttachmentsChange }) => {
+  const [editing, setEditing] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
+  const n = daysFromToday(milestone.targetDate);
+  const isPast = n != null && n < 0;
+
+  if (editing) {
+    return (
+      <div className="tfh-card" style={{ padding: 16, borderColor: "var(--accent)" }}>
+        <MilestoneForm
+          initial={{
+            targetDate: milestone.targetDate || "", title: milestone.title, projectId: milestone.projectId,
+            description: milestone.description || "",
+          }}
+          projects={projects}
+          existingLinks={milestone.links}
+          onRemoveExistingLink={(linkId) => onRemoveLink(milestone, linkId)}
+          submitLabel="Save" busyLabel="Saving…" autoFocusTitle
+          onCancel={() => setEditing(false)}
+          onSubmit={async (values) => { await onSave(milestone, values); setEditing(false); }}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className={`tfh-milestone-row ${isPast ? "past" : ""}`}>
+      <div className="tfh-milestone-when">
+        <div className="tfh-mono" style={{ fontSize: 12, fontWeight: 600, color: isPast ? "var(--text-dim)" : "var(--accent)" }}>
+          {milestone.targetDate ? milestoneDate(milestone.targetDate) : "No date"}
+        </div>
+        {n != null && <div style={{ fontSize: 11, color: n === 0 ? "var(--accent)" : "var(--text-faint)", marginTop: 2 }}>{relativeDay(n)}</div>}
+      </div>
+
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>{milestone.title}</span>
+          <span className="tfh-chip" style={{ background: "var(--raised)", color: "var(--text-dim)", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={milestone.projectName}>
+            <FolderKanban size={10} /> {milestone.projectName}
+          </span>
+        </div>
+        {milestone.description && (
+          <div style={{ fontSize: 12.5, color: "var(--text-dim)", lineHeight: 1.5, marginTop: 4, whiteSpace: "pre-wrap" }}>{milestone.description}</div>
+        )}
+        {(milestone.links || []).length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+            {milestone.links.map((l) => (
+              <a
+                key={l.id} href={normalizeUrl(l.url)} target="_blank" rel="noopener noreferrer"
+                className="tfh-chip tfh-milestone-link" title={l.url}
+              >
+                <Link2 size={11} /> <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.label}</span>
+              </a>
+            ))}
+          </div>
+        )}
+        {(milestone.attachments || []).length > 0 && (
+          <MilestoneAttachmentsMini
+            workspaceId={workspaceId} projectId={milestone.projectId} milestoneId={milestone.id}
+            attachments={milestone.attachments} canManage={canManage}
+            onAdd={(a) => onAttachmentsChange(milestone, [...milestone.attachments, a])}
+            onRemove={(id) => onAttachmentsChange(milestone, milestone.attachments.filter((a) => a.id !== id))}
+          />
+        )}
+        {error && <div style={{ fontSize: 11.5, color: "var(--pri-high)", marginTop: 6 }}>{error}</div>}
+      </div>
+
+      {canManage && (
+        <div style={{ display: "flex", gap: 2, flexShrink: 0, alignItems: "flex-start" }}>
+          {confirmDelete ? (
+            <>
+              <button
+                className="tfh-btn tfh-btn-danger" style={{ fontSize: 11, padding: "4px 9px" }} disabled={deleting}
+                onClick={async () => {
+                  setDeleting(true); setError("");
+                  try { await onDelete(milestone); } catch (err) { setError(err.message); setDeleting(false); setConfirmDelete(false); }
+                }}
+              >
+                {deleting ? "Deleting…" : "Delete"}
+              </button>
+              <button className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11, padding: "4px 8px" }} onClick={() => setConfirmDelete(false)} disabled={deleting}>Keep</button>
+            </>
+          ) : (
+            <>
+              <button className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={() => setEditing(true)} aria-label={`Edit ${milestone.title}`} title="Edit"><Pencil size={13} /></button>
+              <button className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={() => setConfirmDelete(true)} aria-label={`Delete ${milestone.title}`} title="Delete"><Trash2 size={13} /></button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/**
+ * Milestones — one page for the whole workspace: a form at the top (Date,
+ * Title, Project; Details, Link to file, URL) and every milestone below it,
+ * across all projects, upcoming first.
+ *
+ * It replaces the old per-project page, which stacked the project's
+ * timeline, its lead, its reference links and a "mark complete" panel above
+ * the milestones themselves — "a little confusing". Those moved to where
+ * they belong: project details (name, dates, description) open from the
+ * pencil on the project in the sidebar; the project lead is set in Team;
+ * reference links live under Files; completing a project is a drag into
+ * the Completed Projects folder.
+ */
+const MilestonesView = ({ workspaceId, projects, currentProjectId, isWorkspaceManager, currentUserId }) => {
+  const [milestones, setMilestones] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [filter, setFilter] = useState("all");
+
+  // Same rule the server applies (requireProjectManager): workspace admin or
+  // lead, or that project's own lead.
+  const canManageProject = useCallback(
+    (projectId) => isWorkspaceManager || projects.find((p) => p.id === projectId)?.leadId === currentUserId,
+    [isWorkspaceManager, projects, currentUserId]
+  );
+  const formProjects = projects.filter((p) => canManageProject(p.id));
+  const canAddAny = formProjects.some((p) => !p.completedAt);
+  const defaultProject = currentProjectId && formProjects.some((p) => p.id === currentProjectId && !p.completedAt) ? currentProjectId : "";
+
+  const load = useCallback(async (quiet = false) => {
+    if (!quiet) setLoading(true);
+    try {
+      const { milestones: rows } = await api.getWorkspaceMilestones(workspaceId);
+      setMilestones(rows);
+      setLoadError("");
+    } catch (err) {
+      setLoadError(err.message || "Couldn't load milestones.");
+    } finally {
+      if (!quiet) setLoading(false);
+    }
+  }, [workspaceId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Milestones are shared: someone else adding one should show up here
+  // without a reload. Every milestone change already broadcasts this.
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket) return undefined;
+    const onChanged = () => load(true);
+    socket.on("projects:changed", onChanged);
+    return () => socket.off("projects:changed", onChanged);
+  }, [load]);
+
+  const projectName = (id) => projects.find((p) => p.id === id)?.name || "";
+
+  const create = async ({ projectId, title, description, targetDate, link }) => {
+    const { milestone } = await api.createMilestone(workspaceId, projectId, { title, description, targetDate, link });
+    setMilestones((prev) => [...prev, { ...milestone, projectName: projectName(projectId), links: milestone.links || [], attachments: [] }]);
+    load(true);
+  };
+
+  const save = async (m, { projectId, title, description, targetDate, link }) => {
+    const { milestone } = await api.updateMilestone(workspaceId, m.projectId, m.id, { title, description, targetDate, projectId });
+    let links = m.links || [];
+    if (link) {
+      // Created under the milestone's NEW project — it may just have moved.
+      const { link: added } = await api.addMilestoneLink(workspaceId, projectId, m.id, link.label || link.url, link.url);
+      links = [...links, added];
+    }
+    setMilestones((prev) => prev.map((x) => (x.id === m.id ? { ...x, ...milestone, projectId, projectName: projectName(projectId), links } : x)));
+  };
+
+  const remove = async (m) => {
+    await api.deleteMilestone(workspaceId, m.projectId, m.id);
+    setMilestones((prev) => prev.filter((x) => x.id !== m.id));
+  };
+
+  const removeLink = async (m, linkId) => {
+    await api.deleteMilestoneLink(workspaceId, m.projectId, m.id, linkId);
+    setMilestones((prev) => prev.map((x) => (x.id === m.id ? { ...x, links: x.links.filter((l) => l.id !== linkId) } : x)));
+  };
+
+  const setAttachments = (m, attachments) => {
+    setMilestones((prev) => prev.map((x) => (x.id === m.id ? { ...x, attachments } : x)));
+  };
+
+  // Upcoming first, soonest at the top — that's what you plan against. Then
+  // what's already happened, most recent first, then anything undated.
+  const today = localDateStr();
+  const shown = milestones.filter((m) => filter === "all" || m.projectId === filter);
+  const upcoming = shown.filter((m) => m.targetDate && m.targetDate >= today).sort((a, b) => a.targetDate.localeCompare(b.targetDate));
+  const past = shown.filter((m) => m.targetDate && m.targetDate < today).sort((a, b) => b.targetDate.localeCompare(a.targetDate));
+  const undated = shown.filter((m) => !m.targetDate);
+  const projectsWithMilestones = projects.filter((p) => milestones.some((m) => m.projectId === p.id));
+
+  const group = (title, rows, hint) => rows.length > 0 && (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8, padding: "0 2px" }}>
+        <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: "var(--text-faint)" }}>{title}</span>
+        <span className="tfh-mono" style={{ fontSize: 11, color: "var(--text-faint)" }}>{rows.length}</span>
+        {hint && <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>{hint}</span>}
+      </div>
+      <div className="tfh-card" style={{ padding: 0, overflow: "hidden" }}>
+        {rows.map((m) => (
+          <MilestoneRow
+            key={m.id} milestone={m} projects={formProjects.length ? formProjects : projects}
+            canManage={canManageProject(m.projectId)} workspaceId={workspaceId}
+            onSave={save} onDelete={remove} onRemoveLink={removeLink} onAttachmentsChange={setAttachments}
+          />
+        ))}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="tfh-fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div>
+        <div className="tfh-display" style={{ fontSize: 26, fontWeight: 600, marginBottom: 4 }}>Milestones</div>
+        <div style={{ fontSize: 13.5, color: "var(--text-dim)" }}>Key dates for every project, in one list.</div>
+      </div>
+
+      {canAddAny ? (
+        <div className="tfh-card" style={{ padding: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+            <Flag size={15} color="var(--accent)" />
+            <span style={{ fontSize: 14, fontWeight: 700 }}>Add a milestone</span>
+          </div>
+          <MilestoneForm
+            initial={{ projectId: defaultProject }}
+            projects={formProjects}
+            submitLabel="Add milestone" busyLabel="Adding…"
+            onSubmit={create}
+          />
+        </div>
+      ) : (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--text-dim)", background: "var(--raised)", padding: "9px 12px", borderRadius: 10 }}>
+          <Lock size={13} /> View only — your admin, team lead, or a project's own lead adds milestones.
+        </div>
+      )}
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 14, fontWeight: 700 }}>All milestones</span>
+        {projectsWithMilestones.length > 1 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginLeft: "auto" }}>
+            <FolderKanban size={13} color="var(--text-faint)" />
+            <select
+              className="tfh-input" value={filter} onChange={(e) => setFilter(e.target.value)}
+              style={{ fontSize: 12.5, minWidth: 200, paddingTop: 6, paddingBottom: 6 }} aria-label="Show milestones for project"
+            >
+              <option value="all">All projects ({milestones.length})</option>
+              {projectsWithMilestones.map((p) => (
+                <option key={p.id} value={p.id}>{p.name} ({milestones.filter((m) => m.projectId === p.id).length})</option>
+              ))}
+            </select>
+          </div>
+        )}
+      </div>
+
+      {loading ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: 30, justifyContent: "center" }}><Spinner /> <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Loading…</span></div>
+      ) : loadError ? (
+        <div style={{ fontSize: 12.5, color: "var(--pri-high)" }}>{loadError} <button className="tfh-btn tfh-btn-ghost" style={{ fontSize: 12 }} onClick={() => load()}>Try again</button></div>
+      ) : shown.length === 0 ? (
+        <div className="tfh-card" style={{ padding: 30, textAlign: "center" }}>
+          <Flag size={22} color="var(--text-faint)" style={{ marginBottom: 8 }} />
+          <div style={{ fontSize: 13, color: "var(--text-dim)" }}>
+            No milestones yet{canAddAny ? " — add the first one with the form above." : "."}
+          </div>
+        </div>
+      ) : (
+        <>
+          {group("Upcoming", upcoming, "soonest first")}
+          {group("Past", past, "most recent first")}
+          {group("No date", undated)}
+        </>
+      )}
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* System performance — real, measured metrics: API round-trip, DB      */
+/* query latency, realtime socket status, backend uptime                */
+/* ------------------------------------------------------------------ */
+const formatUptime = (seconds) => {
+  if (seconds < 60) return `${seconds}s`;
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+};
+
+// Bands are deliberately generous — this app talks to a free-tier Render
+// backend and a pooled Supabase connection, where 200-400ms is completely
+// normal, not a problem. These thresholds reflect that reality rather
+// than numbers borrowed from a dedicated low-latency service.
+const speedBand = (ms, fastMax, okMax) => {
+  if (ms == null) return { label: "Unreachable", color: "var(--pri-high)", score: 0 };
+  if (ms <= fastMax) return { label: "Fast", color: "var(--stage-done)", score: 100 };
+  if (ms <= okMax) return { label: "OK", color: "var(--pri-medium)", score: 70 };
+  return { label: "Slow", color: "var(--pri-high)", score: 40 };
+};
+
+const SystemHealthView = () => {
+  const [health, setHealth] = useState(null);
+  const [apiRoundTripMs, setApiRoundTripMs] = useState(null);
+  const [checkedAt, setCheckedAt] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+
+  const runCheck = async () => {
+    setLoading(true);
+    setFailed(false);
+    const start = performance.now();
+    try {
+      const data = await api.getHealth();
+      setApiRoundTripMs(Math.round(performance.now() - start));
+      setHealth(data);
+      setCheckedAt(new Date());
+    } catch {
+      setFailed(true);
+      setHealth(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    runCheck();
+    const interval = setInterval(runCheck, 30000); // refresh every 30s while this tab is open
+    return () => clearInterval(interval);
+  }, []);
+
+  const apiBand = failed ? speedBand(null, 0, 0) : speedBand(apiRoundTripMs, 300, 800);
+  const dbBand = health?.db?.ok ? speedBand(health.db.latencyMs, 50, 200) : speedBand(null, 0, 0);
+  const socket = getSocket();
+  const realtimeOk = !!socket?.connected;
+
+  const scores = [apiBand.score, dbBand.score, realtimeOk ? 100 : 50];
+  const overallPct = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+  const overallColor = overallPct >= 85 ? "var(--stage-done)" : overallPct >= 60 ? "var(--pri-medium)" : "var(--pri-high)";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      <div className="tfh-card" style={{ padding: 28, textAlign: "center" }}>
+        <div className="tfh-label" style={{ marginBottom: 10 }}>System Performance</div>
+        {loading && !health ? (
+          <div style={{ fontSize: 13, color: "var(--text-faint)", padding: "20px 0" }}>Checking…</div>
+        ) : (
+          <>
+            <div style={{ fontSize: 56, fontWeight: 700, color: overallColor, lineHeight: 1 }}>{overallPct}%</div>
+            <div style={{ fontSize: 12.5, color: "var(--text-dim)", marginTop: 10 }}>
+              {checkedAt ? `Measured just now — checked ${checkedAt.toLocaleTimeString()}, refreshes every 30s` : "Not yet checked"}
+            </div>
+          </>
+        )}
+        <button className="tfh-btn tfh-btn-ghost" onClick={runCheck} disabled={loading} style={{ marginTop: 14 }}>
+          <RefreshCw size={13} /> {loading ? "Checking…" : "Check now"}
+        </button>
+      </div>
+
+      <div className="tfh-card" style={{ padding: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 14 }}>Live measurements</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 12.5 }}>API response time</div>
+              <div style={{ fontSize: 11, color: "var(--text-faint)" }}>Round-trip from your browser, just now</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: apiBand.color }}>{apiBand.label}</div>
+              <div className="tfh-mono" style={{ fontSize: 11, color: "var(--text-faint)" }}>{failed ? "—" : `${apiRoundTripMs}ms`}</div>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 12.5 }}>Database</div>
+              <div style={{ fontSize: 11, color: "var(--text-faint)" }}>Real query round-trip, timed on the server</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: dbBand.color }}>{health?.db?.ok ? dbBand.label : "Unreachable"}</div>
+              <div className="tfh-mono" style={{ fontSize: 11, color: "var(--text-faint)" }}>{health?.db?.ok ? `${health.db.latencyMs}ms` : "—"}</div>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 12.5 }}>Realtime (live updates)</div>
+              <div style={{ fontSize: 11, color: "var(--text-faint)" }}>Whether this browser's socket is connected right now</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: realtimeOk ? "var(--stage-done)" : "var(--pri-medium)" }}>{realtimeOk ? "Connected" : "Disconnected"}</div>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 12.5 }}>Backend uptime</div>
+              <div style={{ fontSize: 11, color: "var(--text-faint)" }}>Time since the server process last restarted</div>
+            </div>
+            <div className="tfh-mono" style={{ fontSize: 13, color: "var(--text-dim)" }}>{health ? formatUptime(health.uptimeSeconds) : "—"}</div>
+          </div>
+        </div>
+      </div>
+
+      {failed && (
+        <div className="tfh-card" style={{ padding: 16, borderColor: "var(--pri-high)" }}>
+          <div style={{ fontSize: 12.5, color: "var(--pri-high)" }}>Couldn't reach the backend just now — this itself is a real signal something's down, not a display bug.</div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Renaming the workspace. The name is the app's wordmark — the sidebar and
+// every screen header render it — so it belongs in the product, not in a
+// database console. Admin only, matching the server-side check.
+const WorkspaceSettings = ({ workspaceId, currentName, onRenamed }) => {
+  const [name, setName] = useState(currentName || "");
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+
+  // Keep the field in step if the workspace is renamed elsewhere (another
+  // admin, another tab) rather than stranding a stale value in the input.
+  useEffect(() => { setName(currentName || ""); }, [currentName]);
+
+  const dirty = name.trim() && name.trim() !== currentName;
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!dirty) return;
+    setBusy(true);
+    setError("");
+    setSaved(false);
+    try {
+      await api.renameWorkspace(workspaceId, name.trim());
+      await onRenamed();
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2500);
+    } catch (err) {
+      setError(err.message || "Couldn't rename the workspace.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="tfh-card" style={{ padding: 20, maxWidth: 520 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <Building2 size={15} color="var(--accent)" />
+        <span style={{ fontSize: 13.5, fontWeight: 700 }}>Workspace name</span>
+      </div>
+      <div style={{ fontSize: 12.5, color: "var(--text-dim)", marginBottom: 14, lineHeight: 1.5 }}>
+        This is what appears at the top of the sidebar and on every screen. Changing it
+        updates it for everyone in the workspace immediately.
+      </div>
+      <form onSubmit={submit} style={{ display: "flex", gap: 8 }}>
+        <input
+          className="tfh-input" value={name} onChange={(e) => setName(e.target.value)}
+          placeholder={`e.g. ${BRAND.shortName}`} maxLength={80} aria-label="Workspace name"
+        />
+        <button className="tfh-btn tfh-btn-accent" disabled={busy || !dirty} style={{ flexShrink: 0 }}>
+          {busy ? "Saving…" : "Save"}
+        </button>
+      </form>
+      {saved && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--accent)", marginTop: 10 }}>
+          <Check size={13} /> Renamed — the sidebar is updated.
+        </div>
+      )}
+      {error && <div style={{ fontSize: 12.5, color: "var(--pri-high)", marginTop: 10 }}>{error}</div>}
+    </div>
+  );
+};
+
+const AdminPanelView = (props) => {
+  const [tab, setTab] = useState("health");
+
+  return (
+    <div className="tfh-fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <Shield size={20} color="var(--accent)" />
+          <span className="tfh-display" style={{ fontSize: 26, fontWeight: 600 }}>Admin Panel</span>
+        </div>
+        <div style={{ fontSize: 13.5, color: "var(--text-dim)" }}>Project performance and team management, in one place — visible only to the admin and team lead.</div>
+      </div>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <button className={`tfh-btn ${tab === "health" ? "tfh-btn-accent" : ""}`} onClick={() => setTab("health")}><Shield size={13} /> System Performance</button>
+        <button className={`tfh-btn ${tab === "team" ? "tfh-btn-accent" : ""}`} onClick={() => setTab("team")}><Users size={13} /> Team Management</button>
+        <button className={`tfh-btn ${tab === "workspace" ? "tfh-btn-accent" : ""}`} onClick={() => setTab("workspace")}><Building2 size={13} /> Workspace</button>
+      </div>
+
+      {tab === "health" ? (
+        <SystemHealthView />
+      ) : tab === "workspace" ? (
+        <WorkspaceSettings
+          workspaceId={props.workspaceId}
+          currentName={props.workspaceName}
+          onRenamed={props.onWorkspaceRenamed}
+        />
+      ) : (
+        <TeamView
+          tasks={props.tasks} users={props.users} currentUser={props.currentUser} onOpen={props.onOpen}
+          onSetRole={props.onSetRole} onSetTitle={props.onSetTitle} onRemoveMember={props.onRemoveMember}
+          onInvite={props.onInvite} canManage={props.canManage} workspaceId={props.workspaceId}
+          projects={props.projects} onSetProjectLead={props.onSetProjectLead}
+        />
+      )}
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Workspace switcher (sidebar dropdown) + first-run creation screen     */
+/* ------------------------------------------------------------------ */
+const WorkspaceSwitcher = () => {
+  const { workspaces, current, switchTo } = useWorkspace();
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const onClick = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  // Only one workspace ever exists in normal use, so there's nothing to
+  // switch between — just show the name, no dropdown chrome at all.
+  if (workspaces.length <= 1) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "6px" }}>
+        <Logo size={32} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="tfh-display" style={{ fontSize: 14, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{current?.name || BRAND.appName}</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ position: "relative" }} ref={ref}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{ display: "flex", alignItems: "center", gap: 9, padding: "6px", borderRadius: 10, border: "none", background: "transparent", width: "100%", textAlign: "left" }}
+      >
+        <Logo size={32} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="tfh-display" style={{ fontSize: 14, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{current?.name || BRAND.appName}</div>
+        </div>
+        <ChevronDown size={14} color="var(--text-faint)" />
+      </button>
+
+      {open && (
+        <div className="tfh-card tfh-fade-in" style={{ position: "absolute", left: 0, top: 46, width: 260, zIndex: 30, padding: 8 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2, maxHeight: 220, overflowY: "auto" }}>
+            {workspaces.map((w) => (
+              <button
+                key={w.id}
+                onClick={() => { switchTo(w.id); setOpen(false); }}
+                style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 9px", borderRadius: 8, border: "none", background: w.id === current?.id ? "var(--accent-soft)" : "transparent", color: "var(--text)", textAlign: "left" }}
+              >
+                <Building2 size={13} color={w.id === current?.id ? "var(--accent)" : "var(--text-faint)"} />
+                <span style={{ flex: 1, fontSize: 12.5, fontWeight: w.id === current?.id ? 600 : 500 }}>{w.name}</span>
+                {w.superAdminAccess
+                  ? <Crown size={11} color="var(--accent)" aria-label="Super Admin access" />
+                  : w.role === "admin" && <Shield size={11} color="var(--stage-done)" />}
+                {w.role === "lead" && <BadgeCheck size={11} color="var(--accent)" />}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const CreateWorkspaceScreen = () => {
+  const { create, refresh } = useWorkspace();
+  const { user, logout } = useAuth();
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await create(name.trim());
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const checkAgain = async () => {
+    setRefreshing(true);
+    try { await refresh(); } finally { setRefreshing(false); }
+  };
+
+  if (!user.isPlatformAdmin) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+        <div className="tfh-card tfh-fade-in" style={{ width: "100%", maxWidth: 420, padding: 30, textAlign: "center" }}>
+          <Logo size={44} />
+          <div className="tfh-display" style={{ fontSize: 20, fontWeight: 600, margin: "16px 0 6px" }}>You're not on a workspace yet</div>
+          <div style={{ fontSize: 13, color: "var(--text-dim)", marginBottom: 22, lineHeight: 1.5 }}>
+            Your account is ready, but you haven't been added to a workspace yet. Ask your administrator to invite <strong>{user.email}</strong>, then check again.
+          </div>
+          <button onClick={checkAgain} className="tfh-btn tfh-btn-accent" style={{ width: "100%", justifyContent: "center", marginBottom: 10 }} disabled={refreshing}>
+            {refreshing ? "Checking…" : "Check again"}
+          </button>
+          <button onClick={logout} className="tfh-btn tfh-btn-ghost" style={{ width: "100%", justifyContent: "center", fontSize: 12.5 }}>
+            <LogOut size={13} /> Sign out
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div className="tfh-card tfh-fade-in" style={{ width: "100%", maxWidth: 420, padding: 30 }}>
+        <Logo size={44} />
+        <div style={{ height: 14 }} />
+        <div className="tfh-display" style={{ fontSize: 22, fontWeight: 600, marginBottom: 6 }}>Create your first workspace</div>
+        <div style={{ fontSize: 13, color: "var(--text-dim)", marginBottom: 22, lineHeight: 1.5 }}>
+          A workspace is its own board, team, and task history. Staff won't see this screen — you invite them in afterwards from the Team page.
+        </div>
+        <form onSubmit={submit}>
+          <label className="tfh-label" htmlFor="ws-name">Workspace name</label>
+          <input id="ws-name" autoFocus className="tfh-input" placeholder="e.g. Product Team" value={name} onChange={(e) => setName(e.target.value)} style={{ marginBottom: 16 }} />
+          {error && <div style={{ fontSize: 12.5, color: "var(--pri-high)", marginBottom: 14 }}>{error}</div>}
+          <button className="tfh-btn tfh-btn-accent" style={{ width: "100%", padding: "10px 14px" }} disabled={busy || !name.trim()}>
+            {busy ? "Creating…" : "Create workspace"}
+          </button>
+        </form>
+        <button onClick={logout} className="tfh-btn tfh-btn-ghost" style={{ width: "100%", justifyContent: "center", marginTop: 10, fontSize: 12.5 }}>
+          <LogOut size={13} /> Sign out
+        </button>
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Project switcher + first-run project creation screen                  */
+/* ------------------------------------------------------------------ */
+// The one project-navigation control in the sidebar — sets both the
+// Board's project filter and the "current project" that Milestones/Files
+// pages need, so clicking a project here is the single way to move
+// between projects (previously this and a separate switcher dropdown
+// overlapped; consolidated into just this one).
+const PROJECT_LIST_OPEN_KEY = "edmo.sidebar.projectsOpen";
+const SIDEBAR_WIDTH_KEY = "edmo.sidebar.width";
+const SIDEBAR_DEFAULT_WIDTH = 216;
+const SIDEBAR_MIN_WIDTH = 160;
+const SIDEBAR_MAX_WIDTH = 420;
+const clampSidebarWidth = (w) => Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(w)));
+
+// One project row. Beyond selecting and drag-reordering, a manager gets
+// Rename (inline, in place — no dialog for a one-field change) and Delete
+// behind a two-step confirm, since deleting a project takes its tasks,
+// milestones and files with it.
+const ProjectRow = ({ project, active, canManage, canComplete, onSelect, onEdit, onDelete, onToggleComplete, dragProps, dragging, dropHint }) => {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const isCompleted = Boolean(project.completedAt);
+
+  const confirmDelete = async () => {
+    setBusy(true); setError("");
+    try { await onDelete(project.id); }
+    catch (err) { setError(err.message || "Couldn't delete."); setBusy(false); setConfirming(false); }
+  };
+
+  if (confirming) {
+    return (
+      <div style={{ padding: "6px 8px", borderRadius: 8, background: "var(--raised)", border: "1px solid var(--pri-high)" }}>
+        <div style={{ fontSize: 11, color: "var(--text)", marginBottom: 6, lineHeight: 1.4 }}>
+          Delete <strong>{project.name}</strong>? Its tasks, milestones and files go too.
+          {!isCompleted && canComplete && <> If it's finished, drag it to <strong>Completed Projects</strong> instead — nothing is lost.</>}
+        </div>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button className="tfh-btn tfh-btn-danger" style={{ fontSize: 11, padding: "3px 8px" }} disabled={busy} onClick={confirmDelete}>
+            {busy ? "Deleting…" : "Delete"}
+          </button>
+          <button className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11, padding: "3px 8px" }} disabled={busy} onClick={() => setConfirming(false)}>Cancel</button>
+        </div>
+        {error && <div style={{ fontSize: 10.5, color: "var(--pri-high)", marginTop: 5 }}>{error}</div>}
+      </div>
+    );
+  }
+
+  const draggable = Boolean(dragProps?.draggable);
+  return (
+    <div className={`tfh-project-row ${dropHint ? "tfh-drop-hint" : ""}`} style={{ display: "flex", alignItems: "center", gap: 2, opacity: dragging ? 0.45 : 1 }}>
+      <button
+        onClick={() => onSelect(project.id)}
+        {...dragProps}
+        className={`tfh-nav-item ${active ? "active" : ""}`}
+        style={{ fontSize: 12.5, padding: "7px 10px", flex: 1, minWidth: 0, cursor: draggable ? "grab" : "pointer" }}
+        title={draggable
+          ? `${project.name} — drag to reorder, or onto ${isCompleted ? "All projects to reopen it" : "Completed Projects when it's finished"}`
+          : project.name}
+      >
+        <span style={{ width: 6, height: 6, borderRadius: 999, background: isCompleted ? "var(--success)" : "var(--stage-progress)", flexShrink: 0 }} />
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: isCompleted ? "var(--text-dim)" : undefined }}>{project.name}</span>
+      </button>
+      {(canManage || canComplete) && (
+        <div className="tfh-project-actions" style={{ display: "flex", gap: 1, flexShrink: 0 }}>
+          {/* The keyboard / touch way to do what the drag does — a drag
+              alone would leave anyone without a mouse unable to file it. */}
+          {canComplete && (
+            <button
+              className="tfh-btn tfh-btn-ghost" style={{ padding: 4 }}
+              onClick={(e) => { e.stopPropagation(); onToggleComplete(project, !isCompleted); }}
+              aria-label={isCompleted ? `Move ${project.name} back to projects` : `Move ${project.name} to Completed Projects`}
+              title={isCompleted ? "Move back to projects" : "Move to Completed Projects"}
+            >
+              {isCompleted ? <ArchiveRestore size={11} color="var(--text-faint)" /> : <FolderCheck size={11} color="var(--text-faint)" />}
+            </button>
+          )}
+          {canComplete && (
+            <button
+              className="tfh-btn tfh-btn-ghost" style={{ padding: 4 }}
+              onClick={(e) => { e.stopPropagation(); onEdit(project); }}
+              aria-label={`Edit ${project.name}`} title="Name, dates and description"
+            >
+              <Pencil size={11} color="var(--text-faint)" />
+            </button>
+          )}
+          {canManage && (
+            <button
+              className="tfh-btn tfh-btn-ghost" style={{ padding: 4 }}
+              onClick={(e) => { e.stopPropagation(); setConfirming(true); }}
+              aria-label={`Delete ${project.name}`} title="Delete"
+            >
+              <Trash2 size={11} color="var(--text-faint)" />
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/**
+ * PROJECTS in the sidebar: New project, search, "All projects" (the active
+ * ones), and the "Completed Projects" folder directly beneath it.
+ *
+ * Completing a project is a drag: pick a project up and drop it on the
+ * Completed Projects folder. It leaves the regular list at once. Drag one
+ * back out (onto "All projects" or any project in the list) to reopen it.
+ * The same moves are on the small folder button beside each project, for
+ * keyboard and touch. Nothing is deleted either way: a completed project's
+ * tasks, milestones and files stay exactly as they were, it's just filed.
+ */
+const ProjectsSidebarList = ({ projects, activeFilter, onSelectProject, canManage, currentUserId, onCreateProject, onReorder, onDeleteProject, onSetComplete, onEditProject }) => {
+  // Collapsed by default — the list opens on demand (see the render below).
+  // The user's own last choice is remembered, per browser.
+  const [expanded, setExpanded] = useState(() => {
+    try { return localStorage.getItem(PROJECT_LIST_OPEN_KEY) === "1"; } catch { return false; }
+  });
+  const [showCompleted, setShowCompleted] = useState(false);
+  // Thirty-odd projects is more than anyone scrolls through. Deliberately NOT
+  // persisted: a filter you don't remember setting, silently hiding most of
+  // your projects the next morning, is worse than retyping three letters.
+  const [query, setQuery] = useState("");
+  const searchRef = useRef(null);
+
+  const setExpandedPersisted = (next) => {
+    setExpanded((prev) => {
+      const value = typeof next === "function" ? next(prev) : next;
+      try { localStorage.setItem(PROJECT_LIST_OPEN_KEY, value ? "1" : "0"); } catch { /* private mode — in-memory only */ }
+      return value;
+    });
+  };
+
+  // drag = { id, from: "active" | "completed" } while something is held.
+  const [drag, setDrag] = useState(null);
+  const [order, setOrder] = useState(null); // optimistic order of active-project ids while reordering
+  const [hot, setHot] = useState(null); // "completed" | "all" — the folder row lit up as a drop target
+  const dropped = useRef(false);
+  // "Moved X to Completed Projects · Undo" — a drag is quick and easy to do
+  // by accident, so the undo is one click away for a few seconds.
+  const [notice, setNotice] = useState(null);
+  const noticeTimer = useRef(null);
+  useEffect(() => () => window.clearTimeout(noticeTimer.current), []);
+
+  const needle = query.trim().toLowerCase();
+  const matches = (p) => !needle || String(p.name || "").toLowerCase().includes(needle);
+  // The counts stay TRUE counts — they describe the workspace, not the
+  // current search, and a number that moves as you type reads like projects
+  // are disappearing.
+  const allActive = projects.filter((p) => !p.completedAt);
+  const allCompleted = projects.filter((p) => p.completedAt);
+  const active = allActive.filter(matches);
+  const completed = allCompleted.filter(matches)
+    // Most recently finished first: that's the one you're likely looking for.
+    .sort((a, b) => String(b.completedAt).localeCompare(String(a.completedAt)));
+  const searching = needle.length > 0;
+
+  const orderedActive = order
+    ? order.map((id) => active.find((p) => p.id === id)).filter(Boolean)
+    : active;
+
+  // Who may file a project: the server's rule (requireProjectManager) —
+  // workspace admin/lead, or that project's own lead.
+  const canCompleteProject = (p) => canManage || (currentUserId && p.leadId === currentUserId);
+  // Reordering is disabled while a search is active: the drag maths works on
+  // positions in the FULL list, so a reorder in a filtered view would land in
+  // the wrong place and persist. Filing into Completed is fine either way.
+  const canReorder = canManage && !searching;
+
+  const flash = (text, undo) => {
+    window.clearTimeout(noticeTimer.current);
+    setNotice({ text, undo });
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 7000);
+  };
+
+  const setComplete = async (project, complete, { withUndo = true } = {}) => {
+    try {
+      await onSetComplete(project.id, complete);
+      if (complete) setShowCompleted(false); // filed away, out of sight — that's the point
+      if (withUndo) {
+        flash(
+          complete ? `“${project.name}” moved to Completed Projects` : `“${project.name}” is back in your projects`,
+          () => setComplete(project, !complete, { withUndo: false })
+        );
+      } else {
+        setNotice(null);
+      }
+    } catch (err) {
+      flash(err.message || "Couldn't move that project.", null);
+    }
+  };
+
+  const startDrag = (e, p, from) => {
+    dropped.current = false;
+    // Firefox won't start a drag without data on the transfer.
+    try { e.dataTransfer.setData("text/plain", p.id); e.dataTransfer.effectAllowed = "move"; } catch { /* old browsers */ }
+    setDrag({ id: p.id, from });
+    if (from === "active" && canReorder && !order) setOrder(allActive.map((x) => x.id));
+  };
+  const endDrag = () => {
+    // Let go somewhere that isn't a target: put the list back as it was
+    // rather than leave an unsaved order on screen.
+    if (!dropped.current) setOrder(null);
+    setDrag(null);
+    setHot(null);
+  };
+
+  // Over another ACTIVE project: reorder live (active drags), or accept a
+  // completed project being dragged back out.
+  const overActiveRow = (e, overId) => {
+    if (!drag) return;
+    if (drag.from === "completed") { e.preventDefault(); setHot("all"); return; }
+    if (!canReorder) return;
+    e.preventDefault();
+    if (drag.id === overId) return;
+    setOrder((prev) => {
+      const base = prev || allActive.map((p) => p.id);
+      const from = base.indexOf(drag.id);
+      const to = base.indexOf(overId);
+      if (from === -1 || to === -1) return base;
+      const next = [...base];
+      next.splice(from, 1);
+      next.splice(to, 0, drag.id);
+      return next;
+    });
+  };
+  const dropOnActiveRow = (e) => {
+    e.preventDefault();
+    dropped.current = true;
+    const held = drag && projects.find((p) => p.id === drag.id);
+    if (held && drag.from === "completed") setComplete(held, false);
+    else if (order && onReorder) onReorder(order);
+    setDrag(null); setHot(null);
+  };
+
+  const dropTarget = (kind) => ({
+    onDragOver: (e) => {
+      if (!drag) return;
+      const accepts = kind === "completed" ? drag.from === "active" : drag.from === "completed";
+      if (!accepts) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      if (hot !== kind) setHot(kind);
+    },
+    onDragLeave: (e) => {
+      if (!e.currentTarget.contains(e.relatedTarget)) setHot((h) => (h === kind ? null : h));
+    },
+    onDrop: (e) => {
+      if (!drag) return;
+      e.preventDefault();
+      dropped.current = true;
+      const held = projects.find((p) => p.id === drag.id);
+      setOrder(null); // a reorder shuffled on the way here is not what was asked for
+      setDrag(null); setHot(null);
+      if (!held) return;
+      if (kind === "completed" && drag.from === "active") setComplete(held, true);
+      if (kind === "all" && drag.from === "completed") setComplete(held, false);
+    },
+  });
+
+  const rowFor = (p, from) => {
+    const mayDrag = from === "active" ? (canReorder || canCompleteProject(p)) : canCompleteProject(p);
+    return (
+      <ProjectRow
+        key={p.id} project={p} active={activeFilter === p.id}
+        canManage={canManage} canComplete={canCompleteProject(p)}
+        onSelect={onSelectProject} onEdit={onEditProject} onDelete={onDeleteProject}
+        onToggleComplete={(proj, complete) => setComplete(proj, complete)}
+        dragging={drag?.id === p.id}
+        dragProps={mayDrag ? {
+          draggable: true,
+          onDragStart: (e) => startDrag(e, p, from),
+          onDragEnd: endDrag,
+          ...(from === "active" ? { onDragOver: (e) => overActiveRow(e, p.id), onDrop: dropOnActiveRow } : {}),
+        } : {}}
+      />
+    );
+  };
+
+  const draggingActive = drag?.from === "active";
+  const draggingCompleted = drag?.from === "completed";
+  const showFolder = allCompleted.length > 0 || canManage || projects.some(canCompleteProject);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.5, padding: "0 10px", marginBottom: 4 }}>Projects</div>
+      {/* New project sits ABOVE the list and is visible whether or not the
+          list is expanded. Open to every member. */}
+      <div style={{ padding: "0 4px 6px" }}>
+        <NewProjectButton onCreateProject={onCreateProject} />
+      </div>
+
+      {/* Search: only worth the room once there are enough projects to lose one in. */}
+      {allActive.length + allCompleted.length >= 8 && (
+        <div className="tfh-project-search">
+          <Search size={12} color="var(--text-faint)" />
+          <input
+            ref={searchRef}
+            className="tfh-project-search-input"
+            value={query}
+            placeholder="Search projects…"
+            aria-label="Search projects"
+            onChange={(e) => {
+              setQuery(e.target.value);
+              // Typing into a collapsed list would show nothing at all.
+              if (e.target.value.trim()) setExpandedPersisted(true);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") { e.preventDefault(); setQuery(""); searchRef.current?.blur(); }
+            }}
+          />
+          {searching && (
+            <button
+              type="button"
+              onClick={() => { setQuery(""); searchRef.current?.focus(); }}
+              className="tfh-project-search-clear"
+              aria-label="Clear the project search"
+              title="Clear"
+            >
+              <X size={11} />
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* "All projects": selects the all-projects filter AND opens the list;
+          the chevron alone opens/closes it. While a COMPLETED project is
+          being dragged, it's the drop target that reopens it. */}
+      <div
+        style={{ display: "flex", alignItems: "center", gap: 2, borderRadius: 9 }}
+        className={hot === "all" ? "tfh-drop-target hot" : draggingCompleted ? "tfh-drop-target" : ""}
+        {...dropTarget("all")}
+      >
+        <button
+          onClick={() => { onSelectProject("all"); setExpandedPersisted(true); }}
+          className={`tfh-nav-item ${activeFilter === "all" ? "active" : ""}`}
+          style={{ fontSize: 12.5, padding: "7px 10px", flex: 1, minWidth: 0 }}
+        >
+          <FolderKanban size={13} /> {draggingCompleted ? "Drop here to reopen" : "All projects"}
+          {allActive.length > 0 && !draggingCompleted && (
+            <span className="tfh-mono" style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-faint)" }}>
+              {searching ? `${active.length}/${allActive.length}` : allActive.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setExpandedPersisted((e) => !e)}
+          className="tfh-btn tfh-btn-ghost"
+          style={{ padding: 5, flexShrink: 0 }}
+          aria-label={expanded ? "Hide the project list" : "Show the project list"}
+          aria-expanded={expanded}
+          title={expanded ? "Hide the project list" : "Show the project list"}
+        >
+          {expanded ? <ChevronUp size={13} color="var(--text-faint)" /> : <ChevronDown size={13} color="var(--text-faint)" />}
+        </button>
+      </div>
+
+      {/* The Completed Projects folder — directly under All projects, where
+          the Chief drew it. Always there for anyone who can file a project,
+          so it's a visible place to drop one even before the first. */}
+      {showFolder && (
+        <>
+          <div
+            className={`tfh-completed-folder ${hot === "completed" ? "tfh-drop-target hot" : draggingActive ? "tfh-drop-target" : ""}`}
+            {...dropTarget("completed")}
+          >
+            <button
+              onClick={() => setShowCompleted((s) => !s)}
+              className="tfh-nav-item"
+              style={{ fontSize: 12.5, padding: "7px 10px", flex: 1, minWidth: 0 }}
+              aria-expanded={showCompleted}
+              title={allCompleted.length ? (showCompleted ? "Hide completed projects" : "Show completed projects") : "Drag a finished project here"}
+            >
+              <FolderCheck size={13} color={hot === "completed" || draggingActive ? "var(--success)" : undefined} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {draggingActive ? "Drop here — project complete" : "Completed Projects"}
+              </span>
+              {!draggingActive && (
+                <span className="tfh-mono" style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-faint)" }}>
+                  {searching ? `${completed.length}/${allCompleted.length}` : allCompleted.length}
+                </span>
+              )}
+            </button>
+          </div>
+          {(showCompleted || (searching && completed.length > 0)) && (
+            <div className="tfh-completed-list">
+              {completed.map((p) => rowFor(p, "completed"))}
+              {completed.length === 0 && (
+                <div style={{ fontSize: 11, color: "var(--text-faint)", padding: "4px 10px" }}>
+                  {searching ? "No completed project matches." : "Nothing here yet."}
+                </div>
+              )}
+            </div>
+          )}
+          {allCompleted.length === 0 && draggingActive === false && canManage && expanded && allActive.length > 0 && (
+            <div style={{ fontSize: 10.5, color: "var(--text-faint)", padding: "0 12px 4px", lineHeight: 1.45 }}>
+              Finished a project? Drag it onto Completed Projects.
+            </div>
+          )}
+        </>
+      )}
+
+      {notice && (
+        <div className="tfh-sidebar-notice" role="status">
+          <span style={{ flex: 1, minWidth: 0 }}>{notice.text}</span>
+          {notice.undo && (
+            <button type="button" className="tfh-btn tfh-btn-ghost" style={{ fontSize: 11, padding: "2px 7px", color: "var(--accent)" }} onClick={() => notice.undo()}>
+              Undo
+            </button>
+          )}
+        </div>
+      )}
+
+      {expanded && orderedActive.map((p) => rowFor(p, "active"))}
+      {/* A search that finds nothing says so. Silence reads as a broken list. */}
+      {expanded && searching && active.length === 0 && completed.length === 0 && (
+        <div style={{ fontSize: 11.5, color: "var(--text-faint)", padding: "8px 12px", lineHeight: 1.5 }}>
+          No project matching “{query.trim()}”.
+        </div>
+      )}
+    </div>
+  );
+};
+
+
+const CreateProjectScreen = ({ canManage, onCreate, workspaceName, logout }) => {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [deadline, setDeadline] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await onCreate(name.trim(), description.trim(), deadline || null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!canManage) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+        <div className="tfh-card tfh-fade-in" style={{ width: "100%", maxWidth: 420, padding: 30, textAlign: "center" }}>
+          <Logo size={44} />
+          <div className="tfh-display" style={{ fontSize: 20, fontWeight: 600, margin: "16px 0 6px" }}>No projects yet</div>
+          <div style={{ fontSize: 13, color: "var(--text-dim)", marginBottom: 20, lineHeight: 1.5 }}>
+            <strong>{workspaceName}</strong> doesn't have any projects set up. Ask your admin or team lead to create one — you'll see it here as soon as they do.
+          </div>
+          <button onClick={logout} className="tfh-btn tfh-btn-ghost" style={{ width: "100%", justifyContent: "center", fontSize: 12.5 }}>
+            <LogOut size={13} /> Sign out
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div className="tfh-card tfh-fade-in" style={{ width: "100%", maxWidth: 440, padding: 30 }}>
+        <Logo size={44} />
+        <div style={{ height: 14 }} />
+        <div className="tfh-display" style={{ fontSize: 22, fontWeight: 600, marginBottom: 6 }}>Create your first project</div>
+        <div style={{ fontSize: 13, color: "var(--text-dim)", marginBottom: 22, lineHeight: 1.5 }}>
+          Projects keep tasks segregated inside <strong>{workspaceName}</strong> — each one gets its own board, files, and history.
+        </div>
+        <form onSubmit={submit}>
+          <label className="tfh-label" htmlFor="proj-name">Project name</label>
+          <input id="proj-name" autoFocus className="tfh-input" placeholder="e.g. Website Relaunch" value={name} onChange={(e) => setName(e.target.value)} style={{ marginBottom: 14 }} />
+          <label className="tfh-label" htmlFor="proj-desc">Description (optional)</label>
+          <textarea id="proj-desc" className="tfh-input" rows={2} placeholder="What is this project about?" value={description} onChange={(e) => setDescription(e.target.value)} style={{ marginBottom: 14, resize: "vertical" }} />
+          <label className="tfh-label" htmlFor="proj-deadline">Deadline <span style={{ textTransform: "none", fontWeight: 400 }}>(optional)</span></label>
+          <DateField id="proj-deadline" value={deadline} onChange={setDeadline} style={{ marginBottom: 16 }} ariaLabel="Project deadline" />
+          {error && <div style={{ fontSize: 12.5, color: "var(--pri-high)", marginBottom: 14 }}>{error}</div>}
+          <button className="tfh-btn tfh-btn-accent" style={{ width: "100%", padding: "10px 14px" }} disabled={busy || !name.trim()}>
+            {busy ? "Creating…" : "Create project"}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Super Admin — the whole system: every workspace, every account        */
+/* ------------------------------------------------------------------ */
+
+// A password the server made up, shown exactly once with a copy button.
+const OneTimePassword = ({ email, password, onDone }) => {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(`Email: ${email}\nPassword: ${password}`); setCopied(true); } catch { setCopied(false); }
+  };
+  return (
+    <div className="tfh-onetime" role="status">
+      <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 6 }}>Give these sign-in details to the person — the password is shown only now</div>
+      <div className="tfh-mono" style={{ fontSize: 13, lineHeight: 1.7 }}>
+        <div>Email: <strong>{email}</strong></div>
+        <div>Password: <strong style={{ letterSpacing: 0.5 }}>{password}</strong></div>
+      </div>
+      <div style={{ fontSize: 11.5, color: "var(--text-dim)", margin: "6px 0 10px" }}>
+        They should change it after signing in (their name, top right → Edit profile → Change password).
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button type="button" className="tfh-btn" onClick={copy}>{copied ? <><Check size={13} /> Copied</> : "Copy details"}</button>
+        <button type="button" className="tfh-btn tfh-btn-ghost" onClick={onDone}>Done</button>
+      </div>
+    </div>
+  );
+};
+
+const SuperAdminView = ({ currentUserId, onOpenWorkspace }) => {
+  const { refresh: refreshWorkspaces, create: createWorkspace } = useWorkspace();
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
+  const [busy, setBusy] = useState(null); // id of the row an action is running on
+  const [notice, setNotice] = useState(null); // { email, password } or { text }
+  const [rowError, setRowError] = useState({});
+
+  const load = useCallback(async () => {
+    try { setData(await api.superAdminOverview()); setError(""); }
+    catch (err) { setError(err.message || "Couldn't load the system overview."); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  // ---- new account form ----
+  const [form, setForm] = useState({ name: "", email: "", workspaceId: "", role: "member", password: "", superAdmin: false });
+  const [formBusy, setFormBusy] = useState(false);
+  const [formError, setFormError] = useState("");
+  const setF = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
+  const createAccount = async (e) => {
+    e.preventDefault();
+    setFormBusy(true); setFormError("");
+    try {
+      const res = await api.superAdminCreateUser({
+        name: form.name, email: form.email.trim(),
+        password: form.password || undefined,
+        workspaceId: form.workspaceId || undefined, role: form.workspaceId ? form.role : undefined,
+        superAdmin: form.superAdmin,
+      });
+      setNotice(res.temporaryPassword
+        ? { email: res.user.email, password: res.temporaryPassword }
+        : { text: `Account created for ${res.user.email} with the password you set.` });
+      setForm({ name: "", email: "", workspaceId: form.workspaceId, role: "member", password: "", superAdmin: false });
+      await load();
+    } catch (err) { setFormError(err.message); }
+    finally { setFormBusy(false); }
+  };
+
+  // ---- new workspace ----
+  const [wsName, setWsName] = useState("");
+  const [wsBusy, setWsBusy] = useState(false);
+  const [wsError, setWsError] = useState("");
+  const addWorkspace = async (e) => {
+    e.preventDefault();
+    if (!wsName.trim()) return;
+    setWsBusy(true); setWsError("");
+    try { await createWorkspace(wsName.trim()); setWsName(""); await load(); }
+    catch (err) { setWsError(err.message); }
+    finally { setWsBusy(false); }
+  };
+
+  const act = async (rowId, fn) => {
+    setBusy(rowId); setRowError((m) => ({ ...m, [rowId]: "" }));
+    try { await fn(); await load(); }
+    catch (err) { setRowError((m) => ({ ...m, [rowId]: err.message })); }
+    finally { setBusy(null); }
+  };
+
+  if (error) return <div className="tfh-card" style={{ padding: 20, color: "var(--pri-high)", fontSize: 13 }}>{error}</div>;
+  if (!data) return <div style={{ display: "flex", alignItems: "center", gap: 8, padding: 30, justifyContent: "center" }}><Spinner /> <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Loading…</span></div>;
+
+  const needle = query.trim().toLowerCase();
+  const users = data.users.filter((u) => !needle || `${u.name} ${u.email}`.toLowerCase().includes(needle));
+  const superAdmins = data.users.filter((u) => u.isSuperAdmin).length;
+
+  return (
+    <div className="tfh-fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div>
+        <div className="tfh-display" style={{ fontSize: 26, fontWeight: 600, marginBottom: 4, display: "flex", alignItems: "center", gap: 10 }}>
+          <Crown size={22} color="var(--accent)" /> Super Admin
+        </div>
+        <div style={{ fontSize: 13.5, color: "var(--text-dim)" }}>
+          The whole system: every workspace and every account. You can open any workspace as its admin without being added to it.
+        </div>
+      </div>
+
+      {notice && (notice.password
+        ? <OneTimePassword email={notice.email} password={notice.password} onDone={() => setNotice(null)} />
+        : <div className="tfh-onetime" role="status" style={{ display: "flex", alignItems: "center", gap: 10 }}><Check size={15} color="var(--success)" /><span style={{ flex: 1, fontSize: 13 }}>{notice.text}</span><button className="tfh-btn tfh-btn-ghost" onClick={() => setNotice(null)}>Done</button></div>)}
+
+      <div className="tfh-sa-stats">
+        {[["Workspaces", data.workspaces.length], ["Accounts", data.users.length], ["Super Admins", superAdmins]].map(([label, n]) => (
+          <div key={label} className="tfh-card" style={{ padding: "14px 16px" }}>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: "var(--text-faint)", fontWeight: 700 }}>{label}</div>
+            <div style={{ fontSize: 24, fontWeight: 700, marginTop: 2 }}>{n}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Workspaces */}
+      <div className="tfh-card" style={{ padding: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+          <Building2 size={15} color="var(--accent)" />
+          <span style={{ fontSize: 14, fontWeight: 700 }}>Workspaces</span>
+          <form onSubmit={addWorkspace} style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+            <input className="tfh-input" placeholder="New workspace name" value={wsName} onChange={(e) => setWsName(e.target.value)} style={{ fontSize: 12.5, width: 220 }} aria-label="New workspace name" />
+            <button className="tfh-btn tfh-btn-accent" disabled={wsBusy || !wsName.trim()}><Plus size={13} /> {wsBusy ? "Creating…" : "Create"}</button>
+          </form>
+        </div>
+        {wsError && <div style={{ fontSize: 12, color: "var(--pri-high)", marginBottom: 8 }}>{wsError}</div>}
+        <div className="tfh-sa-table" role="table" aria-label="Workspaces">
+          <div className="tfh-sa-row tfh-sa-head" role="row">
+            <span>Name</span><span>Members</span><span>Projects</span><span>Activities</span><span>Your access</span><span />
+          </div>
+          {data.workspaces.map((w) => (
+            <div key={w.id} className="tfh-sa-row" role="row">
+              <span style={{ fontWeight: 600 }}>{w.name}</span>
+              <span>{w.memberCount}</span>
+              <span>{w.projectCount}</span>
+              <span>{w.taskCount}</span>
+              <span>{w.superAdminAccess
+                ? <span className="tfh-chip" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}><Crown size={10} /> Super Admin</span>
+                : <span className="tfh-chip" style={{ background: "var(--raised)", color: "var(--text-dim)" }}>{ROLE_LABEL[w.role] || w.role}</span>}</span>
+              <span style={{ textAlign: "right" }}>
+                <button className="tfh-btn tfh-btn-ghost" style={{ fontSize: 12 }} onClick={() => onOpenWorkspace(w.id)}>Open</button>
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* New account */}
+      <form onSubmit={createAccount} className="tfh-card" style={{ padding: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <UserPlus size={15} color="var(--accent)" />
+          <span style={{ fontSize: 14, fontWeight: 700 }}>Create an account</span>
+        </div>
+        <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 12 }}>
+          For staff who can't use an email invite. Leave the password empty and a strong one is made for you and shown once.
+        </div>
+        <div className="tfh-sa-form">
+          <div><label className="tfh-label" htmlFor="sa-name">Full name</label><input id="sa-name" className="tfh-input" value={form.name} onChange={setF("name")} required /></div>
+          <div><label className="tfh-label" htmlFor="sa-email">Email</label><input id="sa-email" type="email" className="tfh-input" value={form.email} onChange={setF("email")} required /></div>
+          <div>
+            <label className="tfh-label" htmlFor="sa-ws">Add to workspace</label>
+            <select id="sa-ws" className="tfh-input" value={form.workspaceId} onChange={setF("workspaceId")}>
+              <option value="">— not yet —</option>
+              {data.workspaces.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="tfh-label" htmlFor="sa-role">Role there</label>
+            <select id="sa-role" className="tfh-input" value={form.role} onChange={setF("role")} disabled={!form.workspaceId}>
+              <option value="member">Member</option><option value="lead">Lead</option><option value="admin">Admin</option>
+            </select>
+          </div>
+          <div>
+            <label className="tfh-label" htmlFor="sa-pw">Password <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(optional, 8+)</span></label>
+            <input id="sa-pw" type="text" autoComplete="new-password" className="tfh-input" value={form.password} onChange={setF("password")} placeholder="Generate one for me" />
+          </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, color: "var(--text-dim)", alignSelf: "end", paddingBottom: 9, cursor: "pointer" }}>
+            <input type="checkbox" checked={form.superAdmin} onChange={setF("superAdmin")} /> Make Super Admin
+          </label>
+        </div>
+        {formError && <div role="alert" style={{ fontSize: 12, color: "var(--pri-high)", marginTop: 10 }}>{formError}</div>}
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+          <button className="tfh-btn tfh-btn-accent" disabled={formBusy || !form.name.trim() || !form.email.trim()}><UserPlus size={13} /> {formBusy ? "Creating…" : "Create account"}</button>
+        </div>
+      </form>
+
+      {/* Accounts */}
+      <div className="tfh-card" style={{ padding: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+          <Users size={15} color="var(--accent)" />
+          <span style={{ fontSize: 14, fontWeight: 700 }}>Accounts</span>
+          <div className="tfh-project-search" style={{ marginLeft: "auto", width: 240, margin: "0 0 0 auto" }}>
+            <Search size={12} color="var(--text-faint)" />
+            <input className="tfh-project-search-input" placeholder="Search name or email…" value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search accounts" />
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column" }}>
+          {users.map((u) => {
+            const isMe = u.id === currentUserId;
+            const notIn = data.workspaces.filter((w) => !u.memberships.some((m) => m.workspaceId === w.id));
+            return (
+              <div key={u.id} className="tfh-sa-user">
+                <Avatar member={u} size={30} />
+                <div style={{ flex: 1, minWidth: 200 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 13.5, fontWeight: 600 }}>{u.name}</span>
+                    {isMe && <span style={{ fontSize: 11, color: "var(--text-faint)" }}>(you)</span>}
+                    {u.isSuperAdmin && <span className="tfh-chip" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}><Crown size={10} /> Super Admin</span>}
+                  </div>
+                  <div style={{ fontSize: 12, color: "var(--text-faint)" }}>{u.email}</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+                    {u.memberships.map((m) => (
+                      <span key={m.workspaceId} className="tfh-sa-membership">
+                        <Building2 size={10} /> {m.workspaceName}
+                        <select
+                          value={m.role} disabled={busy === u.id}
+                          onChange={(e) => act(u.id, () => api.superAdminSetMembership(m.workspaceId, u.id, e.target.value))}
+                          aria-label={`${u.name}'s role in ${m.workspaceName}`}
+                        >
+                          <option value="member">Member</option><option value="lead">Lead</option><option value="admin">Admin</option>
+                        </select>
+                      </span>
+                    ))}
+                    {u.memberships.length === 0 && <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>Not in any workspace</span>}
+                    {notIn.length > 0 && (
+                      <select
+                        className="tfh-sa-add" value="" disabled={busy === u.id}
+                        onChange={(e) => e.target.value && act(u.id, () => api.superAdminSetMembership(e.target.value, u.id, "member"))}
+                        aria-label={`Add ${u.name} to a workspace`}
+                      >
+                        <option value="">+ Add to workspace…</option>
+                        {notIn.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
+                      </select>
+                    )}
+                  </div>
+                  {rowError[u.id] && <div style={{ fontSize: 11.5, color: "var(--pri-high)", marginTop: 6 }}>{rowError[u.id]}</div>}
+                </div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  {!isMe && (
+                    <button
+                      className="tfh-btn" style={{ fontSize: 12 }} disabled={busy === u.id}
+                      onClick={() => act(u.id, async () => { const r = await api.superAdminResetPassword(u.id); setNotice({ email: r.email, password: r.temporaryPassword }); })}
+                      title="Make a new password for this person and sign out their sessions"
+                    >
+                      <Lock size={12} /> Reset password
+                    </button>
+                  )}
+                  <button
+                    className="tfh-btn tfh-btn-ghost" style={{ fontSize: 12 }} disabled={busy === u.id || (u.isSuperAdmin && superAdmins <= 1)}
+                    onClick={() => act(u.id, async () => { await api.superAdminSetSuperAdmin(u.id, !u.isSuperAdmin); if (isMe) await refreshWorkspaces(); })}
+                    title={u.isSuperAdmin && superAdmins <= 1 ? "The system needs at least one Super Admin" : u.superAdminFromEnv ? "Set by PLATFORM_ADMIN_EMAILS on the server" : ""}
+                  >
+                    <Crown size={12} /> {u.isSuperAdmin ? "Remove Super Admin" : "Make Super Admin"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+          {users.length === 0 && <div style={{ fontSize: 12.5, color: "var(--text-faint)", padding: 10 }}>No account matches “{query}”.</div>}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Change your own password — inside Edit profile. Needs the current one; the
+// server signs out every other session and hands this one a fresh token.
+const ChangePasswordSection = () => {
+  const [open, setOpen] = useState(false);
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null); // { ok, text }
+
+  const submit = async () => {
+    if (next.length < 8) { setMsg({ ok: false, text: "The new password must be at least 8 characters." }); return; }
+    if (next !== confirm) { setMsg({ ok: false, text: "The two new passwords don't match." }); return; }
+    setBusy(true); setMsg(null);
+    try {
+      await api.changePassword(current, next);
+      setCurrent(""); setNext(""); setConfirm("");
+      setMsg({ ok: true, text: "Password changed. You've been signed out everywhere else." });
+    } catch (err) { setMsg({ ok: false, text: err.message }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ borderTop: "1px solid var(--line)", paddingTop: 14, marginBottom: 14 }}>
+      <button type="button" onClick={() => setOpen((o) => !o)} className="tfh-btn tfh-btn-ghost" style={{ fontSize: 12.5, padding: "4px 6px" }} aria-expanded={open}>
+        <KeyRound size={13} /> Change password {open ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+      </button>
+      {open && (
+        <div className="tfh-expand-in" style={{ display: "grid", gap: 10, marginTop: 10 }}>
+          <div><label className="tfh-label" htmlFor="pw-current">Current password</label><input id="pw-current" type="password" autoComplete="current-password" className="tfh-input" value={current} onChange={(e) => setCurrent(e.target.value)} /></div>
+          <div><label className="tfh-label" htmlFor="pw-new">New password <span style={{ textTransform: "none", fontWeight: 400, color: "var(--text-faint)" }}>(8+ characters)</span></label><input id="pw-new" type="password" autoComplete="new-password" className="tfh-input" value={next} onChange={(e) => setNext(e.target.value)} /></div>
+          <div><label className="tfh-label" htmlFor="pw-confirm">New password again</label><input id="pw-confirm" type="password" autoComplete="new-password" className="tfh-input" value={confirm} onChange={(e) => setConfirm(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } }} /></div>
+          {msg && <div role="status" style={{ fontSize: 12, color: msg.ok ? "var(--success)" : "var(--pri-high)" }}>{msg.text}</div>}
+          <div><button type="button" className="tfh-btn" onClick={submit} disabled={busy || !current || !next || !confirm}>{busy ? "Changing…" : "Change password"}</button></div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const EditProfileModal = ({ member, currentUser, workspaceId, onClose, onProfileUpdated, onMembersUpdated }) => {
+  const [name, setName] = useState(currentUser.name);
+  const [title, setTitle] = useState(member?.title || "");
+  const [avatarBusy, setAvatarBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const inputRef = useRef(null);
+
+  const handleAvatarFile = async (files) => {
+    const file = files?.[0];
+    if (!file) return;
+    setAvatarBusy(true);
+    setError("");
+    try {
+      const { user } = await api.uploadAvatar(file);
+      invalidateAvatarCache(user.id);
+      onProfileUpdated(user);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAvatarBusy(false);
+      if (inputRef.current) inputRef.current.value = "";
+    }
+  };
+
+  const save = async (e) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setSaving(true);
+    setError("");
+    try {
+      if (name.trim() !== currentUser.name) {
+        const { user } = await api.updateProfile(name.trim());
+        onProfileUpdated(user);
+      }
+      if (workspaceId && title.trim() && title.trim() !== member?.title) {
+        const { members } = await api.setMemberTitle(workspaceId, currentUser.id, title.trim());
+        onMembersUpdated(members);
+      }
+      onClose();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="tfh-modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="tfh-card tfh-modal-card" style={{ width: "100%", maxWidth: 420, padding: 24 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+          <span className="tfh-display" style={{ fontSize: 19, fontWeight: 600 }}>Edit profile</span>
+          <button className="tfh-btn tfh-btn-ghost" style={{ padding: 6 }} onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 22 }}>
+          <button
+            type="button" onClick={() => inputRef.current?.click()} disabled={avatarBusy}
+            style={{ position: "relative", border: "none", background: "none", padding: 0, cursor: "pointer" }}
+            title="Change photo"
+          >
+            <Avatar member={member || currentUser} size={76} />
+            <div style={{ position: "absolute", bottom: 0, right: 0, width: 26, height: 26, borderRadius: 999, background: "var(--accent)", border: "3px solid var(--panel)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              {avatarBusy ? <Loader2 size={13} color="var(--accent-ink)" className="tfh-pulse" /> : <Pencil size={13} color="var(--accent-ink)" />}
+            </div>
+            <input ref={inputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => handleAvatarFile(e.target.files)} />
+          </button>
+        </div>
+
+        <form onSubmit={save}>
+          <label className="tfh-label" htmlFor="profile-name">Name</label>
+          <input id="profile-name" className="tfh-input" value={name} onChange={(e) => setName(e.target.value)} style={{ marginBottom: 14 }} />
+
+          {workspaceId && (
+            <>
+              <label className="tfh-label" htmlFor="profile-title">Post / designation</label>
+              <input id="profile-title" list="profile-post-suggestions" className="tfh-input" placeholder="e.g. Product Designer" value={title} onChange={(e) => setTitle(e.target.value)} style={{ marginBottom: 16 }} />
+              <datalist id="profile-post-suggestions">
+                {POST_SUGGESTIONS.map((p) => <option key={p} value={p} />)}
+              </datalist>
+            </>
+          )}
+
+          <ChangePasswordSection />
+
+          {error && <div style={{ fontSize: 12.5, color: "var(--pri-high)", marginBottom: 14 }}>{error}</div>}
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, borderTop: "1px solid var(--line)", paddingTop: 16 }}>
+            <button type="button" className="tfh-btn" onClick={onClose}>Cancel</button>
+            <button className="tfh-btn tfh-btn-accent" disabled={saving || !name.trim()}>{saving ? "Saving…" : "Save changes"}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Workspace shell                                                       */
+/* ------------------------------------------------------------------ */
+function Workspace() {
+  const { user, logout, setUser } = useAuth();
+  const { current, currentId, loading: workspaceLoading, refresh: refreshWorkspaces, switchTo: switchWorkspace } = useWorkspace();
+  const { projects, current: currentProject, currentId: projectId, loading: projectsLoading, create: createProject, refresh: refreshProjects, switchTo: switchProject } = useProject();
+
+  const [tasks, setTasks] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [view, setViewRaw] = useState(() => localStorage.getItem("edmo_view") || "dashboard");
+  const setView = (v) => { setViewRaw(v); localStorage.setItem("edmo_view", v); };
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [permission, setPermission] = useState(typeof Notification !== "undefined" ? Notification.permission : "denied");
+
+  const [search, setSearch] = useState("");
+  const [priorityFilter, setPriorityFilter] = useState("all");
+  const [assigneeFilter, setAssigneeFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [projectFilter, setProjectFilter] = useState(projectId || "all");
+  // Keep the Board filter in step with the sidebar's current project when it
+  // changes — but only when they've genuinely diverged, so this never fires
+  // redundantly and races the click handler that sets both at once.
+  useEffect(() => {
+    if (projectId && projectId !== projectFilter) setProjectFilter(projectId);
+  }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [draft, setDraft] = useState(null);
+  // Sidebar width, dragged like a spreadsheet column. Clamped so it can't
+  // be dragged to nothing (unrecoverable without clearing storage) or wide
+  // enough to crowd out the content.
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try {
+      const stored = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY), 10);
+      return Number.isFinite(stored) ? clampSidebarWidth(stored) : SIDEBAR_DEFAULT_WIDTH;
+    } catch { return SIDEBAR_DEFAULT_WIDTH; }
+  });
+  const [resizing, setResizing] = useState(false);
+
+  const setSidebarWidthPersisted = (next) => {
+    const width = clampSidebarWidth(next);
+    setSidebarWidth(width);
+    try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width)); } catch { /* private mode — in-memory only */ }
+  };
+
+  const startResize = (e) => {
+    e.preventDefault();
+    setResizing(true);
+    const onMove = (ev) => setSidebarWidth(clampSidebarWidth(ev.clientX));
+    const onUp = (ev) => {
+      setResizing(false);
+      setSidebarWidthPersisted(ev.clientX);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      // Text selection is disabled during the drag (see .tfh-resizing) —
+      // without it the whole page highlights as you sweep across it.
+      document.body.classList.remove("tfh-resizing");
+    };
+    document.body.classList.add("tfh-resizing");
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  // A logged activity picked from global search. With the Collaboration Log
+  // module gone there's no page to send them to, so it opens the same detail
+  // popup the dashboard uses.
+  const [searchActivity, setSearchActivity] = useState(null);
+  const [bulkAddOpen, setBulkAddOpen] = useState(false);
+  const [editProfileOpen, setEditProfileOpen] = useState(false);
+  // The project whose details (name, dates, description) are open for editing.
+  const [editingProject, setEditingProject] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [uploadPhase, setUploadPhase] = useState(false);
+
+  // A Super Admin opening a workspace they aren't a member of acts as its
+  // admin (the server grants the same) — they just aren't on its roster.
+  const currentUser = useMemo(
+    () => users.find((u) => u.id === user.id) || { ...user, role: current?.superAdminAccess ? "admin" : "member", superAdminAccess: Boolean(current?.superAdminAccess) },
+    [users, user, current?.superAdminAccess]
+  );
+  const canManage = currentUser.role === "admin" || currentUser.role === "lead";
+  const loadAll = async (workspaceId) => {
+    setLoading(true);
+    const [membersRes, notifRes, tasksRes] = await Promise.all([api.getMembers(workspaceId), api.getNotifications(), api.getAllTasks(workspaceId)]);
+    setUsers(membersRes.members);
+    setNotifications(notifRes.notifications);
+    setTasks(tasksRes.tasks);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    if (currentId && !projectsLoading) loadAll(currentId);
+  }, [currentId, projectsLoading]);
+  useEffect(() => { if (view === "admin" && !canManage) setView("dashboard"); }, [view, canManage]);
+  // If there's no project (or the current one disappears), only the
+  // Dashboard, Board, and Team views make sense — everything else needs a
+  // specific project. Board now works without one selected (workspace-wide).
+  useEffect(() => { if (!projectId && !["dashboard", "team", "activity", "board", "superadmin"].includes(view)) setView("dashboard"); }, [projectId, view]);
+  useEffect(() => { if (view === "superadmin" && !user.isPlatformAdmin) setView("dashboard"); }, [view, user.isPlatformAdmin]);
+
+  // Realtime: socket listeners, scoped to the workspace currently being viewed
+  useEffect(() => {
+    const socket = connectSocket() || getSocket();
+    if (!socket || !currentId) return;
+
+    const onNotification = (notif) => {
+      setNotifications((prev) => [notif, ...prev]);
+      if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+        const isReminder = notif.type === "reminder";
+        try {
+          const popup = new Notification(isReminder ? `${BRAND.appName} reminder` : BRAND.appName, {
+            body: isReminder ? notif.message.replace(/^Reminder: /, "") : notif.message,
+            icon: "/logo.png",
+            // One pop-up per reminder even if several tabs are open, and a
+            // reminder stays on screen until dealt with, as a calendar's does.
+            tag: `edmo-${notif.id}`,
+            requireInteraction: isReminder,
+          });
+          // Clicking it brings the app forward and opens the task.
+          popup.onclick = () => {
+            window.focus();
+            if (notif.taskId) openEditByIdRef.current?.(notif.taskId);
+            popup.close();
+          };
+        } catch { /* some browsers only allow pop-ups from a service worker; the bell still has it */ }
+      }
+    };
+    const onTaskChanged = (payload) => {
+      if (payload?.workspaceId && payload.workspaceId !== currentId) return;
+      api.getAllTasks(currentId).then((r) => setTasks(r.tasks));
+    };
+    const onLeadChanged = (payload) => {
+      if (payload?.workspaceId && payload.workspaceId !== currentId) return;
+      api.getMembers(currentId).then((r) => setUsers(r.members));
+    };
+    const onMembersChanged = (payload) => {
+      if (payload?.workspaceId && payload.workspaceId !== currentId) return;
+      api.getMembers(currentId).then((r) => setUsers(r.members));
+    };
+
+    socket.on("notification:new", onNotification);
+    socket.on("task:changed", onTaskChanged);
+    socket.on("lead:changed", onLeadChanged);
+    socket.on("members:changed", onMembersChanged);
+
+    return () => {
+      socket.off("notification:new", onNotification);
+      socket.off("task:changed", onTaskChanged);
+      socket.off("lead:changed", onLeadChanged);
+      socket.off("members:changed", onMembersChanged);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, currentId, projectId, canManage]);
+
+  const requestPermission = async () => {
+    if (typeof Notification === "undefined") return;
+    const result = await Notification.requestPermission();
+    setPermission(result);
+  };
+
+  // Every hook must run on every render, so this lives with the other hooks
+  // and above the early returns below — React counts them positionally, and
+  // a useMemo after a conditional return crashes the app with "rendered more
+  // hooks than during the previous render" the moment a load finishes.
+  // Rebuilt only when the roster changes: this value sits above the whole
+  // tree, so a fresh object every render would re-render every row.
+  const viewerContextValue = useMemo(
+    () => ({ viewerId: user.id, membersById: new Map((users || []).map((u) => [u.id, u])) }),
+    [user.id, users]
+  );
+
+  const openCreate = (status = "todo") => { setDraft(emptyDraft(status, users, user.id, projectId)); setSaveError(""); };
+  // Assign Task → new-task dialog prefilled with this member as assignee.
+  const openCreateFor = (member) => { setDraft({ ...emptyDraft("todo", users, member.id, projectId), assigneeId: member.id }); setSaveError(""); };
+  const openEdit = (task) => {
+    setDraft({ ...task, originalProjectId: task.projectId, subtasks: task.subtasks.map((s) => ({ ...s })), reminderRows: task.reminderCount ? null : [], originalReminders: [], remindersForSeries: false });
+    setSaveError("");
+    // Reminders live in their own table and load on open. Only applied if
+    // the same task is still open by the time they arrive.
+    if (task.reminderCount) {
+      api.getTaskReminders(currentId, task.projectId, task.id)
+        .then(({ reminders }) => setDraft((prev) => (prev && prev.id === task.id
+          ? { ...prev, reminderRows: reminders.map(reminderToRow), originalReminders: reminders.map(({ minutesBefore, method }) => ({ minutesBefore, method })) }
+          : prev)))
+        .catch(() => setDraft((prev) => (prev && prev.id === task.id ? { ...prev, reminderRows: [], remindersError: true } : prev)));
+    }
+  };
+  const openEditById = (id) => { const t = tasks.find((x) => x.id === id); if (t) openEdit(t); };
+  // The socket handler is registered once; the ref always points at the
+  // current openEditById so a pop-up click opens the task from today's list.
+  const openEditByIdRef = useRef(openEditById);
+  openEditByIdRef.current = openEditById;
+  const closeDialog = () => { setDraft(null); setSaveError(""); };
+
+  // The Collaboration Log module was removed — activities are created and
+  // tracked through "Initiate Collaboration" now. Previously logged entries
+  // are still READ on the dashboard and in search (nothing was deleted), but
+  // there's no longer a page to navigate to, so a search hit on one just
+  // opens its detail popup where it stands.
+
+  const saveDraft = async () => {
+    if (!draft.title.trim()) return;
+    if (!draft.projectId) { setSaveError("Choose which project this task belongs to."); return; }
+    setSaving(true);
+    setSaveError("");
+    setUploadPhase(false);
+    try {
+      // pendingLinks/pendingFiles are client-only scratch state (File objects
+      // aren't JSON-serializable) — strip them before sending the subtasks
+      // payload, then use the original draft.subtasks (which still has them)
+      // to fire the actual uploads once each subtask has a real id.
+      const cleanSubtasks = draft.subtasks.map(({ pendingLinks, pendingFiles, ...s }) => s);
+      // "No Specific Project (General)" is a sentinel in the dropdown —
+      // resolve it to the workspace's real, reusable General project here
+      // (created on first use), so the task still gets a valid project id.
+      let taskProjectId = draft.projectId;
+      if (taskProjectId === "__general__") {
+        const { projectId: generalId } = await api.ensureGeneralProject(currentId);
+        taskProjectId = generalId;
+      }
+      let savedTask;
+      let taskId;
+
+      if (draft.id) {
+        // Managers can change everything, including who it's assigned to.
+        // A plain member editing their OWN task gets the same full patch
+        // minus assigneeId — reassigning stays manager-only even then.
+        // Anyone else shouldn't reach this path at all (fields are locked
+        // client-side and the server rejects it regardless).
+        // Same definition as the dialog uses to unlock the fields: yours if
+        // it is assigned to you or you created it. If these two ever drift
+        // apart, a member gets an editable form whose save is refused.
+        const isOwnTask = isAssignedTo(draft, user.id) || draft.createdBy === user.id;
+        const patch = canManage
+          ? { title: draft.title, description: draft.description, meetingNotes: draft.meetingNotes || "", status: draft.status, priority: draft.priority, assigneeId: draft.assigneeId, assignee2Id: draft.assignee2Id || null, due: draft.due, dueTime: draft.dueTime || null, endTime: draft.endTime || null }
+          : isOwnTask
+            ? { title: draft.title, description: draft.description, meetingNotes: draft.meetingNotes || "", status: draft.status, priority: draft.priority, due: draft.due, dueTime: draft.dueTime || null, endTime: draft.endTime || null }
+            : { status: draft.status };
+        // The repeat rule only ever travels on the series head — the server
+        // rejects it on an occurrence, and sending it unchanged from one
+        // would be a pointless round trip anyway.
+        if (canManage || isOwnTask) {
+          // On the series head this carries the whole rule. On an occurrence
+          // only `null` is meaningful — "stop repeating" — and the server
+          // applies it to the series head. Sending it unchanged from an
+          // occurrence would be a no-op round trip, so skip that case.
+          if (!draft.recurrenceParentId) patch.recurrence = draft.recurrence || null;
+          else if (draft.stopSeries) patch.recurrence = null;
+        }
+        // If the project was changed (fixing a mis-file), include it — but
+        // the API call must still go to the ORIGINAL project's path, since
+        // that's where the task currently lives until the move lands.
+        const routeProjectId = draft.originalProjectId || taskProjectId;
+        if ((canManage || isOwnTask) && taskProjectId !== draft.originalProjectId) {
+          patch.projectId = taskProjectId;
+        }
+        await api.updateTask(currentId, routeProjectId, draft.id, patch);
+        let { task } = await api.setSubtasks(currentId, patch.projectId || routeProjectId, draft.id, cleanSubtasks);
+        // Reminders: only sent when they actually changed (and loaded), and
+        // AFTER the task update so they count back from the new date/time.
+        if ((canManage || isOwnTask) && draft.due && Array.isArray(draft.reminderRows)) {
+          const wanted = rowsToReminders(draft.reminderRows);
+          if (remindersKey(wanted) !== remindersKey(draft.originalReminders)) {
+            try {
+              await api.setTaskReminders(currentId, patch.projectId || routeProjectId, draft.id, wanted, draft.remindersForSeries ? "series" : "this");
+              task = { ...task, reminderCount: wanted.length };
+            } catch (err) {
+              setTasks((prev) => prev.map((t) => (t.id === task.id ? task : t)));
+              setSaveError(`Saved, but the reminders didn't: ${err.message}`);
+              return;
+            }
+          }
+        }
+        savedTask = task;
+        taskId = draft.id;
+      } else {
+        // links go straight in the JSON payload (they're just text, created
+        // atomically with the task server-side); pendingFiles can't — those
+        // upload as a real follow-up request right below, once the task has
+        // an id to attach to.
+        const { title, description, meetingNotes, status, priority, assigneeId, assignee2Id, due, dueTime, endTime, recurrence } = draft;
+        const { task } = await api.createTask(currentId, taskProjectId, {
+          title, description, meetingNotes: meetingNotes || "", status, priority, assigneeId, assignee2Id: assignee2Id || null, due, dueTime, endTime: endTime || null,
+          recurrence: recurrence || null,
+          // Reminders count back from the due date, so none without one.
+          reminders: due ? rowsToReminders(draft.reminderRows) : [],
+          subtasks: cleanSubtasks, links: draft.pendingLinks,
+        });
+        savedTask = task;
+        taskId = task.id;
+      }
+
+      // From here on the task itself is safely saved — a failed file upload
+      // below should never look like the whole save failed, and should
+      // never trigger a duplicate task on retry. Track each job with a label
+      // so a partial failure can name exactly what didn't make it.
+      const uploadJobs = [];
+      draft.subtasks.forEach((s, i) => {
+        const real = savedTask.subtasks[i];
+        if (!real) return;
+        (s.pendingLinks || []).forEach((l) => uploadJobs.push({ label: `link "${l.label}" on "${s.text}"`, run: () => api.addSubtaskLink(currentId, taskProjectId, taskId, real.id, l.label, l.url) }));
+        (s.pendingFiles || []).forEach((f) => uploadJobs.push({ label: `file "${f.name}" on "${s.text}"`, run: () => api.uploadSubtaskAttachment(currentId, taskProjectId, taskId, real.id, f) }));
+      });
+      if (!draft.id) {
+        draft.pendingFiles.forEach((f) => uploadJobs.push({ label: `file "${f.name}"`, run: () => api.uploadAttachment(currentId, taskProjectId, taskId, f) }));
+      }
+
+      if (uploadJobs.length > 0) {
+        setUploadPhase(true);
+        const results = await Promise.allSettled(uploadJobs.map((j) => j.run()));
+        const failed = results.map((r, i) => (r.status === "rejected" ? uploadJobs[i].label : null)).filter(Boolean);
+        const { tasks: refreshed } = await api.getAllTasks(currentId);
+        setTasks(refreshed);
+        if (failed.length > 0) {
+          // The task and everything else saved fine — only surface what
+          // genuinely didn't make it, and keep the dialog open so nothing
+          // staged gets silently lost.
+          setSaveError(`Saved, but ${failed.length === 1 ? "this didn't" : "these didn't"} upload: ${failed.join(", ")}. You can try adding ${failed.length === 1 ? "it" : "them"} again below.`);
+          return;
+        }
+      } else if (draft.recurrence || savedTask.recurrence || draft.stopSeries) {
+        // A repeat rule creates or removes sibling occurrences server-side,
+        // so patching the single saved task into local state isn't enough —
+        // refetch so the board/calendar show the whole series right away.
+        const { tasks: refreshed } = await api.getAllTasks(currentId);
+        setTasks(refreshed);
+      } else if (draft.id) {
+        setTasks((prev) => prev.map((t) => (t.id === savedTask.id ? savedTask : t)));
+      } else {
+        setTasks((prev) => [...prev, savedTask]);
+      }
+
+      setDraft(null);
+      // If this task created the General project on the fly, make sure the
+      // projects list reflects it right away (sidebar, Board filter, etc.).
+      if (draft.projectId === "__general__") refreshProjects();
+    } catch (err) {
+      setSaveError(err.message || "Something went wrong saving this task. Please try again.");
+    } finally {
+      setSaving(false);
+      setUploadPhase(false);
+    }
+  };
+
+  const deleteTask = async (id) => {
+    await api.deleteTask(currentId, draft.projectId, id);
+    setTasks((prev) => prev.filter((t) => t.id !== id));
+    setDraft(null);
+  };
+
+  const bulkAddTasks = async ({ tasks, due, priority, projectId: chosenProjectId }) => {
+    let targetProject = chosenProjectId;
+    if (targetProject === "__general__") {
+      const { projectId: generalId } = await api.ensureGeneralProject(currentId);
+      targetProject = generalId;
+    }
+    const { tasks: created } = await api.createTasksBulk(currentId, targetProject, { tasks, due, priority });
+    setTasks((prev) => [...prev, ...created]);
+    if (chosenProjectId === "__general__") refreshProjects();
+  };
+
+  const moveTask = async (id, status) => {
+    const target = tasks.find((t) => t.id === id);
+    if (!target) return;
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status } : t))); // optimistic
+    const { task } = await api.updateTask(currentId, target.projectId, id, { status });
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...task } : t)));
+  };
+  const completeTask = (id) => moveTask(id, "done");
+  const reopenTask = (id) => moveTask(id, "todo");
+
+  const setRole = async (userId, role) => {
+    const { members } = await api.setMemberRole(currentId, userId, role);
+    setUsers(members);
+  };
+
+  const setProjectLeadFor = async (pid, leadId) => {
+    await api.setProjectLead(currentId, pid, leadId);
+    await refreshProjects();
+  };
+
+  const setTitle = async (userId, title) => {
+    const { members } = await api.setMemberTitle(currentId, userId, title);
+    setUsers(members);
+  };
+
+  const removeMember = async (userId) => {
+    const { members } = await api.removeMember(currentId, userId);
+    setUsers(members);
+  };
+
+  const invite = async (email) => {
+    const result = await api.inviteToWorkspace(currentId, email);
+    if (result.members) setUsers(result.members); // existing user added immediately — reflect it now, not after a refresh
+    return result;
+  };
+
+  const markRead = async (id) => {
+    setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, read: true } : n)));
+    await api.markNotificationRead(id);
+  };
+  const markAllRead = async () => {
+    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    await api.markAllRead();
+  };
+
+  if (workspaceLoading) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+        <Spinner /> <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Loading your account…</span>
+      </div>
+    );
+  }
+
+  if (!currentId) {
+    return <CreateWorkspaceScreen />;
+  }
+
+  if (loading || projectsLoading) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+        <Spinner /> <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Loading {current?.name || "workspace"}…</span>
+      </div>
+    );
+  }
+
+  if (!projectId && !canManage) {
+    return <CreateProjectScreen canManage={canManage} onCreate={createProject} workspaceName={current?.name} logout={logout} />;
+  }
+
+  const visibleNav = (canManage ? NAV : NAV.filter((n) => n.id !== "admin"))
+    .filter((n) => n.id !== "superadmin" || user.isPlatformAdmin)
+    .filter((n) => projectId || ["dashboard", "team", "activity", "board", "superadmin"].includes(n.id));
+
+  return (
+    <ViewerContext.Provider value={viewerContextValue}>
+    <div style={{ display: "flex", minHeight: "100vh" }}>
+      {/* Sidebar */}
+      <div
+        className={`tfh-sidebar ${mobileNavOpen ? "open" : ""}`}
+        style={{ width: sidebarWidth, borderRight: "1px solid var(--line)", padding: "20px 14px", display: "flex", flexDirection: "column", gap: 22, background: "var(--ink)", position: "relative", flexShrink: 0 }}
+      >
+        {/* Drag the edge to resize, like a spreadsheet column. The handle is
+            a hair wider than the border it sits on so it's actually grabbable
+            — a 1px target is not. Double-click resets to the default. */}
+        <div
+          className={`tfh-sidebar-resizer ${resizing ? "active" : ""}`}
+          onMouseDown={startResize}
+          onDoubleClick={() => setSidebarWidthPersisted(SIDEBAR_DEFAULT_WIDTH)}
+          onKeyDown={(e) => {
+            // Keyboard-resizable too, since a drag handle is unusable
+            // without a pointer.
+            if (e.key === "ArrowLeft") { e.preventDefault(); setSidebarWidthPersisted(sidebarWidth - 16); }
+            if (e.key === "ArrowRight") { e.preventDefault(); setSidebarWidthPersisted(sidebarWidth + 16); }
+          }}
+          role="separator" aria-orientation="vertical" tabIndex={0}
+          aria-label="Resize the sidebar"
+          aria-valuenow={sidebarWidth} aria-valuemin={SIDEBAR_MIN_WIDTH} aria-valuemax={SIDEBAR_MAX_WIDTH}
+          title="Drag to resize · double-click to reset"
+        />
+        <WorkspaceSwitcher />
+
+        {/* DASHBOARD section: Dashboard + Collaboration Log + Board grouped
+            together at the top (per the Chief's request), each under a
+            "DASHBOARD" header — mirroring how the PROJECTS block is grouped.
+            Then the PROJECTS block, then the remaining menu items. */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.5, padding: "0 10px", marginBottom: 4 }}>Dashboard</div>
+          {/* Files sits directly under Board (the Chief's layout): it's where
+              people go next after the board, not a back-office page. */}
+          {visibleNav.filter((n) => TOP_NAV_IDS.includes(n.id)).map((n) => (
+            <React.Fragment key={n.id}>
+              <button className={`tfh-nav-item ${view === n.id ? "active" : ""}`} onClick={() => { setView(n.id); setMobileNavOpen(false); }}>
+                <n.icon size={16} /> {n.label}
+              </button>
+              {/* Sits between Dashboard and Board, where the Chief asked for
+                  it. It's an ACTION, not a destination, so it never takes the
+                  "active" state and is tinted with the brand accent — a nav
+                  item you click and stay where you are would otherwise look
+                  broken. The top-bar button stays too; this is the same
+                  dialog, reachable without crossing the screen. */}
+              {n.id === "dashboard" && (
+                <button
+                  className="tfh-nav-item tfh-nav-action"
+                  onClick={() => { openCreate("todo"); setMobileNavOpen(false); }}
+                  title="Initiate a collaboration"
+                >
+                  <Plus size={16} /> Initiate Collaboration
+                </button>
+              )}
+            </React.Fragment>
+          ))}
+        </div>
+
+        <ProjectsSidebarList
+          projects={projects}
+          activeFilter={projectFilter}
+          canManage={canManage}
+          currentUserId={user.id}
+          onCreateProject={createProject}
+          onReorder={async (orderedIds) => { await api.reorderProjects(currentId, orderedIds); refreshProjects(); }}
+          onSetComplete={async (id, complete) => { await api.setProjectComplete(currentId, id, complete); await refreshProjects(); }}
+          onEditProject={(p) => setEditingProject(p)}
+          onDeleteProject={async (id) => {
+            await api.deleteProject(currentId, id);
+            const remaining = await refreshProjects();
+            // Deleting the project you were looking at leaves the board
+            // pointed at nothing — fall back to the all-projects view rather
+            // than a blank screen.
+            if (id === projectId || id === projectFilter) {
+              const next = (remaining || []).find((p) => p.id !== id);
+              if (next) switchProject(next.id);
+              setProjectFilter("all");
+            }
+            setTasks((prev) => prev.filter((t) => t.projectId !== id));
+          }}
+          onSelectProject={(id) => {
+            // Order matters: switchProject changes projectId, which fires the
+            // sync effect that sets projectFilter from projectId. So switch
+            // FIRST, then set the filter — otherwise the effect runs last and
+            // could overwrite the filter we just set (the "clicked a project
+            // but its tasks don't show" symptom). For "all", there's nothing
+            // to switch to, so just set the filter directly.
+            if (id !== "all") switchProject(id);
+            setProjectFilter(id);
+            setView("board");
+            setMobileNavOpen(false);
+          }}
+        />
+
+        <nav style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          {visibleNav.filter((n) => !TOP_NAV_IDS.includes(n.id)).map((n) => (
+            <button key={n.id} className={`tfh-nav-item ${view === n.id ? "active" : ""}`} onClick={() => { setView(n.id); setMobileNavOpen(false); }}>
+              <n.icon size={16} /> {n.label}
+            </button>
+          ))}
+        </nav>
+
+        {/* The account block that used to live here has moved to the top
+            bar (see AccountMenu) — it truncated long names down here, and
+            the top-right is where people look for it. */}
+      </div>
+
+      {editingProject && (
+        <ProjectDetailsModal
+          workspaceId={currentId}
+          project={editingProject}
+          onClose={() => setEditingProject(null)}
+          onSaved={refreshProjects}
+        />
+      )}
+
+      {editProfileOpen && (
+        <EditProfileModal
+          member={currentUser}
+          currentUser={user}
+          workspaceId={currentId}
+          onClose={() => setEditProfileOpen(false)}
+          onProfileUpdated={async (updatedUser) => {
+            setUser(updatedUser);
+            invalidateAvatarCache(updatedUser.id);
+            if (currentId) {
+              const { members } = await api.getMembers(currentId);
+              setUsers(members);
+            }
+          }}
+          onMembersUpdated={setUsers}
+        />
+      )}
+
+      {/* Main */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 24px", borderBottom: "1px solid var(--line)" }}>
+          <button className="tfh-btn tfh-btn-ghost tfh-show-mobile-only" onClick={() => setMobileNavOpen(true)} aria-label="Open menu"><Menu size={16} /></button>
+          <span className="tfh-mono tfh-hide-mobile" style={{ fontSize: 11, color: "var(--text-faint)", flexShrink: 0 }}>
+            {new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}
+          </span>
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center", minWidth: 0 }}>
+            {/* Search sits with the other top-right actions, left of Quick
+                add — it's a tool you reach for, not page furniture. */}
+            <GlobalSearch
+              workspaceId={currentId} tasks={tasks} users={users} currentUserId={user.id}
+              onOpenTask={openEdit}
+              onOpenActivityDay={(hit) => setSearchActivity(hit)}
+            />
+            <button className="tfh-btn tfh-btn-accent" style={{ flexShrink: 0 }} onClick={() => openCreate("todo")}>
+              <Plus size={14} /> <span className="tfh-hide-mobile">Initiate Collaboration</span><span className="tfh-show-mobile-only">Initiate</span>
+            </button>
+            <NotificationBell
+              notifications={notifications} onOpenTask={openEditById}
+              onMarkRead={markRead} onMarkAll={markAllRead}
+              permission={permission} onRequestPermission={requestPermission}
+            />
+            <ThemeMenu />
+            <div style={{ width: 1, height: 22, background: "var(--line)", margin: "0 2px", flexShrink: 0 }} />
+            <AccountMenu
+              member={currentUser}
+              authUser={user}
+              onEditProfile={() => setEditProfileOpen(true)}
+              onSignOut={logout}
+            />
+          </div>
+        </div>
+
+        <div style={{ padding: 24, flex: 1, overflowY: "auto" }}>
+          {view === "dashboard" && (
+            <DashboardView
+              workspaceId={currentId} tasks={tasks} users={users} currentUser={currentUser} projects={projects}
+              onOpen={openEdit} hasProject={!!projectId} onCreateProject={createProject} onAssignTask={openCreateFor}
+            />
+          )}
+          {view === "board" && (
+            <BoardView
+              tasks={tasks} users={users} projects={projects} onOpen={openEdit} onComplete={completeTask} onReopen={reopenTask} onAdd={openCreate} onBulkAdd={() => setBulkAddOpen(true)} onCreateProject={createProject} canManage={canManage} currentUserId={user.id}
+              search={search} setSearch={setSearch}
+              priorityFilter={priorityFilter} setPriorityFilter={setPriorityFilter}
+              assigneeFilter={assigneeFilter} setAssigneeFilter={setAssigneeFilter}
+              statusFilter={statusFilter} setStatusFilter={setStatusFilter}
+              projectFilter={projectFilter} setProjectFilter={setProjectFilter}
+              workspaceId={currentId} onOpenFiles={() => setView("files")}
+            />
+          )}
+          {view === "team" && <TeamView tasks={tasks} users={users} currentUser={currentUser} onOpen={openEdit} onSetRole={setRole} onSetTitle={setTitle} onRemoveMember={removeMember} onInvite={invite} canManage={canManage} workspaceId={currentId} projects={projects} onSetProjectLead={setProjectLeadFor} />}
+          {view === "calendar" && <CalendarView tasks={tasks} users={users} onOpen={openEdit} workspaceId={currentId} canManage={canManage} />}
+          {view === "files" && (
+            <DocumentsView
+              workspaceId={currentId} projectId={projectId} projects={projects}
+              projectName={currentProject?.name}
+              isWorkspaceManager={canManage} currentUserId={user.id}
+            />
+          )}
+          {view === "milestones" && (
+            <MilestonesView
+              workspaceId={currentId} projects={projects}
+              currentProjectId={projectFilter !== "all" ? projectFilter : projectId}
+              isWorkspaceManager={canManage} currentUserId={user.id}
+            />
+          )}
+          {view === "superadmin" && user.isPlatformAdmin && (
+            <SuperAdminView currentUserId={user.id} onOpenWorkspace={(id) => { switchWorkspace(id); setView("dashboard"); }} />
+          )}
+          {view === "admin" && canManage && (
+            <AdminPanelView
+              users={users} currentUser={currentUser}
+              tasks={tasks} projects={projects} onOpen={openEdit}
+              onSetRole={setRole} onSetTitle={setTitle} onRemoveMember={removeMember} onInvite={invite}
+              canManage={canManage} workspaceId={currentId} onSetProjectLead={setProjectLeadFor}
+              workspaceName={current?.name} onWorkspaceRenamed={refreshWorkspaces}
+            />
+          )}
+        </div>
+      </div>
+
+      {searchActivity && (
+        <ActivityDetailModal
+          item={searchActivity}
+          projects={projects}
+          currentUserId={user.id}
+          onClose={() => setSearchActivity(null)}
+          onSetStatus={async (hit, next) => {
+            await api.setActivityBlockStatus(currentId, hit.entryDate, hit.blockIndex, next);
+          }}
+        />
+      )}
+
+      {draft && <TaskDialog draft={draft} setDraft={setDraft} users={users} projects={projects} onClose={closeDialog} onSave={saveDraft} onDelete={deleteTask} saving={saving} saveError={saveError} uploadPhase={uploadPhase} isWorkspaceManager={canManage} workspaceId={currentId} currentUserId={user.id} />}
+      {bulkAddOpen && <BulkAddModal users={users} projects={projects} currentProjectId={projectId} currentUserId={user.id} onClose={() => setBulkAddOpen(false)} onSubmit={bulkAddTasks} />}
+    </div>
+    </ViewerContext.Provider>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Root app: auth gate + routes                                          */
+/* ------------------------------------------------------------------ */
+export default function App() {
+  const { user, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <Spinner />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="/register" element={<Register />} />
+        <Route path="/forgot-password" element={<ForgotPassword />} />
+        <Route path="/reset-password" element={<ResetPassword />} />
+        <Route path="*" element={<Navigate to="/login" replace />} />
+      </Routes>
+    );
+  }
+
+  return (
+    <Routes>
+      <Route path="/reset-password" element={<ResetPassword />} />
+      <Route path="/*" element={<Workspace />} />
+    </Routes>
+  );
+}
